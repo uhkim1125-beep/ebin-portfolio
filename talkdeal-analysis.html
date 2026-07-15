@@ -1,0 +1,1270 @@
+<!DOCTYPE html>
+<html lang="ko"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures (htmlToImage undefined) and toPng errors
+            // so the parent always gets a response instead of hanging forever.
+            try {
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>카카오 톡딜 뷰티 분석 리포트</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  // Tailwind CDN 경고 억제
+  if (window.tailwind) {
+    window.tailwind.config = { important: true };
+  }
+</script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;600;700;800&amp;display=swap" rel="stylesheet">
+<style>
+  * { font-family: 'Noto Sans KR', sans-serif; }
+  body { background: #f5f0e8; }
+
+  .tab-btn { transition: all 0.2s ease; border-bottom: 3px solid transparent; }
+  .tab-btn.active { background: #FEE500; color: #1a1a1a; border-bottom: 3px solid #e6cf00; font-weight: 700; }
+  .tab-btn:not(.active):hover { background: #fffde7; border-bottom: 3px solid #FEE500; }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+
+  .kakao-card {
+    background: white;
+    border-radius: 16px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+    padding: 24px;
+  }
+  .rank-badge {
+    width: 32px; height: 32px;
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 800; font-size: 14px;
+    flex-shrink: 0;
+  }
+  .rank-1 { background: #FEE500; color: #1a1a1a; }
+  .rank-2 { background: #e8e8e8; color: #555; }
+  .rank-3 { background: #f4c97a; color: #7a4e00; }
+  .rank-other { background: #f0f0f0; color: #888; }
+
+  .data-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .data-table th {
+    background: #FEE500;
+    color: #1a1a1a;
+    padding: 10px 12px;
+    text-align: left;
+    font-weight: 700;
+  }
+  .data-table td {
+    padding: 9px 12px;
+    border-bottom: 1px solid #f0f0f0;
+    color: #333;
+  }
+  .data-table tr:hover td { background: #fffde7; }
+
+  .main-header { background: linear-gradient(135deg, #FEE500 0%, #ffc000 100%); }
+  .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .bar-container { position: relative; height: 420px; }
+
+  .sub-tab-btn {
+    padding: 6px 14px;
+    border-radius: 20px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s;
+    border: 2px solid #e0e0e0;
+    background: white;
+    color: #555;
+    white-space: nowrap;
+  }
+  .sub-tab-btn.active {
+    background: #FEE500;
+    border-color: #FEE500;
+    color: #1a1a1a;
+    font-weight: 700;
+  }
+
+  .badge-new { background: #e3f2fd; color: #1565c0; padding: 2px 10px; border-radius: 20px; font-size: 11px; font-weight: 600; }
+  .badge-verified { background: #e8f5e9; color: #2e7d32; padding: 2px 10px; border-radius: 20px; font-size: 11px; font-weight: 600; }
+
+  @media (max-width: 768px) {
+    .kakao-card { padding: 16px; }
+    .data-table { font-size: 11px; }
+    .data-table th, .data-table td { padding: 7px 8px; }
+    .tab-btn { font-size: 12px; padding: 10px 10px; }
+  }
+</style>
+<style>*, ::before, ::after{--tw-border-spacing-x:0;--tw-border-spacing-y:0;--tw-translate-x:0;--tw-translate-y:0;--tw-rotate:0;--tw-skew-x:0;--tw-skew-y:0;--tw-scale-x:1;--tw-scale-y:1;--tw-pan-x: ;--tw-pan-y: ;--tw-pinch-zoom: ;--tw-scroll-snap-strictness:proximity;--tw-gradient-from-position: ;--tw-gradient-via-position: ;--tw-gradient-to-position: ;--tw-ordinal: ;--tw-slashed-zero: ;--tw-numeric-figure: ;--tw-numeric-spacing: ;--tw-numeric-fraction: ;--tw-ring-inset: ;--tw-ring-offset-width:0px;--tw-ring-offset-color:#fff;--tw-ring-color:rgb(59 130 246 / 0.5);--tw-ring-offset-shadow:0 0 #0000;--tw-ring-shadow:0 0 #0000;--tw-shadow:0 0 #0000;--tw-shadow-colored:0 0 #0000;--tw-blur: ;--tw-brightness: ;--tw-contrast: ;--tw-grayscale: ;--tw-hue-rotate: ;--tw-invert: ;--tw-saturate: ;--tw-sepia: ;--tw-drop-shadow: ;--tw-backdrop-blur: ;--tw-backdrop-brightness: ;--tw-backdrop-contrast: ;--tw-backdrop-grayscale: ;--tw-backdrop-hue-rotate: ;--tw-backdrop-invert: ;--tw-backdrop-opacity: ;--tw-backdrop-saturate: ;--tw-backdrop-sepia: ;--tw-contain-size: ;--tw-contain-layout: ;--tw-contain-paint: ;--tw-contain-style: }::backdrop{--tw-border-spacing-x:0;--tw-border-spacing-y:0;--tw-translate-x:0;--tw-translate-y:0;--tw-rotate:0;--tw-skew-x:0;--tw-skew-y:0;--tw-scale-x:1;--tw-scale-y:1;--tw-pan-x: ;--tw-pan-y: ;--tw-pinch-zoom: ;--tw-scroll-snap-strictness:proximity;--tw-gradient-from-position: ;--tw-gradient-via-position: ;--tw-gradient-to-position: ;--tw-ordinal: ;--tw-slashed-zero: ;--tw-numeric-figure: ;--tw-numeric-spacing: ;--tw-numeric-fraction: ;--tw-ring-inset: ;--tw-ring-offset-width:0px;--tw-ring-offset-color:#fff;--tw-ring-color:rgb(59 130 246 / 0.5);--tw-ring-offset-shadow:0 0 #0000;--tw-ring-shadow:0 0 #0000;--tw-shadow:0 0 #0000;--tw-shadow-colored:0 0 #0000;--tw-blur: ;--tw-brightness: ;--tw-contrast: ;--tw-grayscale: ;--tw-hue-rotate: ;--tw-invert: ;--tw-saturate: ;--tw-sepia: ;--tw-drop-shadow: ;--tw-backdrop-blur: ;--tw-backdrop-brightness: ;--tw-backdrop-contrast: ;--tw-backdrop-grayscale: ;--tw-backdrop-hue-rotate: ;--tw-backdrop-invert: ;--tw-backdrop-opacity: ;--tw-backdrop-saturate: ;--tw-backdrop-sepia: ;--tw-contain-size: ;--tw-contain-layout: ;--tw-contain-paint: ;--tw-contain-style: }/* ! tailwindcss v3.4.17 | MIT License | https://tailwindcss.com */*,::after,::before{box-sizing:border-box;border-width:0;border-style:solid;border-color:#e5e7eb}::after,::before{--tw-content:''}:host,html{line-height:1.5;-webkit-text-size-adjust:100%;-moz-tab-size:4;tab-size:4;font-family:ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";font-feature-settings:normal;font-variation-settings:normal;-webkit-tap-highlight-color:transparent}body{margin:0;line-height:inherit}hr{height:0;color:inherit;border-top-width:1px}abbr:where([title]){-webkit-text-decoration:underline dotted;text-decoration:underline dotted}h1,h2,h3,h4,h5,h6{font-size:inherit;font-weight:inherit}a{color:inherit;text-decoration:inherit}b,strong{font-weight:bolder}code,kbd,pre,samp{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;font-feature-settings:normal;font-variation-settings:normal;font-size:1em}small{font-size:80%}sub,sup{font-size:75%;line-height:0;position:relative;vertical-align:baseline}sub{bottom:-.25em}sup{top:-.5em}table{text-indent:0;border-color:inherit;border-collapse:collapse}button,input,optgroup,select,textarea{font-family:inherit;font-feature-settings:inherit;font-variation-settings:inherit;font-size:100%;font-weight:inherit;line-height:inherit;letter-spacing:inherit;color:inherit;margin:0;padding:0}button,select{text-transform:none}button,input:where([type=button]),input:where([type=reset]),input:where([type=submit]){-webkit-appearance:button;background-color:transparent;background-image:none}:-moz-focusring{outline:auto}:-moz-ui-invalid{box-shadow:none}progress{vertical-align:baseline}::-webkit-inner-spin-button,::-webkit-outer-spin-button{height:auto}[type=search]{-webkit-appearance:textfield;outline-offset:-2px}::-webkit-search-decoration{-webkit-appearance:none}::-webkit-file-upload-button{-webkit-appearance:button;font:inherit}summary{display:list-item}blockquote,dd,dl,figure,h1,h2,h3,h4,h5,h6,hr,p,pre{margin:0}fieldset{margin:0;padding:0}legend{padding:0}menu,ol,ul{list-style:none;margin:0;padding:0}dialog{padding:0}textarea{resize:vertical}input::placeholder,textarea::placeholder{opacity:1;color:#9ca3af}[role=button],button{cursor:pointer}:disabled{cursor:default}audio,canvas,embed,iframe,img,object,svg,video{display:block;vertical-align:middle}img,video{max-width:100%;height:auto}[hidden]:where(:not([hidden=until-found])){display:none}.sticky{position:sticky !important}.top-0{top:0px !important}.z-50{z-index:50 !important}.mx-auto{margin-left:auto !important;margin-right:auto !important}.mb-1{margin-bottom:0.25rem !important}.mb-2{margin-bottom:0.5rem !important}.mb-3{margin-bottom:0.75rem !important}.mb-4{margin-bottom:1rem !important}.mb-5{margin-bottom:1.25rem !important}.mb-6{margin-bottom:1.5rem !important}.ml-auto{margin-left:auto !important}.mt-0\.5{margin-top:0.125rem !important}.mt-3{margin-top:0.75rem !important}.mt-4{margin-top:1rem !important}.mr-2{margin-right:0.5rem !important}.mt-1{margin-top:0.25rem !important}.mt-2{margin-top:0.5rem !important}.inline-block{display:inline-block !important}.flex{display:flex !important}.grid{display:grid !important}.hidden{display:none !important}.h-12{height:3rem !important}.h-3{height:0.75rem !important}.h-2{height:0.5rem !important}.w-12{width:3rem !important}.w-3{width:0.75rem !important}.w-full{width:100% !important}.min-w-0{min-width:0px !important}.max-w-6xl{max-width:72rem !important}.flex-1{flex:1 1 0% !important}.flex-shrink-0{flex-shrink:0 !important}.flex-wrap{flex-wrap:wrap !important}.items-start{align-items:flex-start !important}.items-center{align-items:center !important}.justify-center{justify-content:center !important}.justify-between{justify-content:space-between !important}.gap-1{gap:0.25rem !important}.gap-2{gap:0.5rem !important}.gap-3{gap:0.75rem !important}.gap-4{gap:1rem !important}.gap-6{gap:1.5rem !important}.space-y-2 > :not([hidden]) ~ :not([hidden]){--tw-space-y-reverse:0 !important;margin-top:calc(0.5rem * calc(1 - var(--tw-space-y-reverse))) !important;margin-bottom:calc(0.5rem * var(--tw-space-y-reverse)) !important}.space-y-3 > :not([hidden]) ~ :not([hidden]){--tw-space-y-reverse:0 !important;margin-top:calc(0.75rem * calc(1 - var(--tw-space-y-reverse))) !important;margin-bottom:calc(0.75rem * var(--tw-space-y-reverse)) !important}.space-y-6 > :not([hidden]) ~ :not([hidden]){--tw-space-y-reverse:0 !important;margin-top:calc(1.5rem * calc(1 - var(--tw-space-y-reverse))) !important;margin-bottom:calc(1.5rem * var(--tw-space-y-reverse)) !important}.overflow-x-auto{overflow-x:auto !important}.truncate{overflow:hidden !important;text-overflow:ellipsis !important;white-space:nowrap !important}.whitespace-nowrap{white-space:nowrap !important}.rounded-full{border-radius:9999px !important}.rounded-xl{border-radius:0.75rem !important}.rounded-lg{border-radius:0.5rem !important}.border-2{border-width:2px !important}.border{border-width:1px !important}.border-blue-200{--tw-border-opacity:1 !important;border-color:rgb(191 219 254 / var(--tw-border-opacity, 1)) !important}.border-green-200{--tw-border-opacity:1 !important;border-color:rgb(187 247 208 / var(--tw-border-opacity, 1)) !important}.border-gray-100{--tw-border-opacity:1 !important;border-color:rgb(243 244 246 / var(--tw-border-opacity, 1)) !important}.border-orange-200{--tw-border-opacity:1 !important;border-color:rgb(254 215 170 / var(--tw-border-opacity, 1)) !important}.border-yellow-100{--tw-border-opacity:1 !important;border-color:rgb(254 249 195 / var(--tw-border-opacity, 1)) !important}.bg-yellow-50{--tw-bg-opacity:1 !important;background-color:rgb(254 252 232 / var(--tw-bg-opacity, 1)) !important}.bg-blue-400{--tw-bg-opacity:1 !important;background-color:rgb(96 165 250 / var(--tw-bg-opacity, 1)) !important}.bg-green-400{--tw-bg-opacity:1 !important;background-color:rgb(74 222 128 / var(--tw-bg-opacity, 1)) !important}.bg-white{--tw-bg-opacity:1 !important;background-color:rgb(255 255 255 / var(--tw-bg-opacity, 1)) !important}.bg-yellow-400{--tw-bg-opacity:1 !important;background-color:rgb(250 204 21 / var(--tw-bg-opacity, 1)) !important}.bg-blue-50{--tw-bg-opacity:1 !important;background-color:rgb(239 246 255 / var(--tw-bg-opacity, 1)) !important}.bg-gray-100{--tw-bg-opacity:1 !important;background-color:rgb(243 244 246 / var(--tw-bg-opacity, 1)) !important}.bg-orange-50{--tw-bg-opacity:1 !important;background-color:rgb(255 247 237 / var(--tw-bg-opacity, 1)) !important}.bg-yellow-100{--tw-bg-opacity:1 !important;background-color:rgb(254 249 195 / var(--tw-bg-opacity, 1)) !important}.bg-gradient-to-r{background-image:linear-gradient(to right, var(--tw-gradient-stops)) !important}.from-yellow-50{--tw-gradient-from:#fefce8 var(--tw-gradient-from-position) !important;--tw-gradient-to:rgb(254 252 232 / 0) var(--tw-gradient-to-position) !important;--tw-gradient-stops:var(--tw-gradient-from), var(--tw-gradient-to) !important}.to-white{--tw-gradient-to:#fff var(--tw-gradient-to-position) !important}.p-3{padding:0.75rem !important}.p-4{padding:1rem !important}.px-3{padding-left:0.75rem !important;padding-right:0.75rem !important}.px-4{padding-left:1rem !important;padding-right:1rem !important}.py-2{padding-top:0.5rem !important;padding-bottom:0.5rem !important}.py-4{padding-top:1rem !important;padding-bottom:1rem !important}.py-6{padding-top:1.5rem !important;padding-bottom:1.5rem !important}.px-2{padding-left:0.5rem !important;padding-right:0.5rem !important}.py-0\.5{padding-top:0.125rem !important;padding-bottom:0.125rem !important}.text-center{text-align:center !important}.text-right{text-align:right !important}.text-2xl{font-size:1.5rem !important;line-height:2rem !important}.text-lg{font-size:1.125rem !important;line-height:1.75rem !important}.text-sm{font-size:0.875rem !important;line-height:1.25rem !important}.text-xl{font-size:1.25rem !important;line-height:1.75rem !important}.text-xs{font-size:0.75rem !important;line-height:1rem !important}.font-black{font-weight:900 !important}.font-bold{font-weight:700 !important}.font-medium{font-weight:500 !important}.font-semibold{font-weight:600 !important}.leading-relaxed{line-height:1.625 !important}.leading-tight{line-height:1.25 !important}.text-blue-700{--tw-text-opacity:1 !important;color:rgb(29 78 216 / var(--tw-text-opacity, 1)) !important}.text-gray-400{--tw-text-opacity:1 !important;color:rgb(156 163 175 / var(--tw-text-opacity, 1)) !important}.text-gray-500{--tw-text-opacity:1 !important;color:rgb(107 114 128 / var(--tw-text-opacity, 1)) !important}.text-gray-700{--tw-text-opacity:1 !important;color:rgb(55 65 81 / var(--tw-text-opacity, 1)) !important}.text-gray-900{--tw-text-opacity:1 !important;color:rgb(17 24 39 / var(--tw-text-opacity, 1)) !important}.text-green-700{--tw-text-opacity:1 !important;color:rgb(21 128 61 / var(--tw-text-opacity, 1)) !important}.text-yellow-500{--tw-text-opacity:1 !important;color:rgb(234 179 8 / var(--tw-text-opacity, 1)) !important}.text-blue-800{--tw-text-opacity:1 !important;color:rgb(30 64 175 / var(--tw-text-opacity, 1)) !important}.text-gray-600{--tw-text-opacity:1 !important;color:rgb(75 85 99 / var(--tw-text-opacity, 1)) !important}.text-gray-800{--tw-text-opacity:1 !important;color:rgb(31 41 55 / var(--tw-text-opacity, 1)) !important}.text-orange-700{--tw-text-opacity:1 !important;color:rgb(194 65 12 / var(--tw-text-opacity, 1)) !important}.text-orange-800{--tw-text-opacity:1 !important;color:rgb(154 52 18 / var(--tw-text-opacity, 1)) !important}.text-yellow-600{--tw-text-opacity:1 !important;color:rgb(202 138 4 / var(--tw-text-opacity, 1)) !important}.text-yellow-700{--tw-text-opacity:1 !important;color:rgb(161 98 7 / var(--tw-text-opacity, 1)) !important}.shadow{--tw-shadow:0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1) !important;--tw-shadow-colored:0 1px 3px 0 var(--tw-shadow-color), 0 1px 2px -1px var(--tw-shadow-color) !important;box-shadow:var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), var(--tw-shadow) !important}.shadow-md{--tw-shadow:0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1) !important;--tw-shadow-colored:0 4px 6px -1px var(--tw-shadow-color), 0 2px 4px -2px var(--tw-shadow-color) !important;box-shadow:var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), var(--tw-shadow) !important}.shadow-sm{--tw-shadow:0 1px 2px 0 rgb(0 0 0 / 0.05) !important;--tw-shadow-colored:0 1px 2px 0 var(--tw-shadow-color) !important;box-shadow:var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), var(--tw-shadow) !important}.transition-all{transition-property:all !important;transition-timing-function:cubic-bezier(0.4, 0, 0.2, 1) !important;transition-duration:150ms !important}.hover\:border-yellow-300:hover{--tw-border-opacity:1 !important;border-color:rgb(253 224 71 / var(--tw-border-opacity, 1)) !important}.hover\:bg-yellow-500:hover{--tw-bg-opacity:1 !important;background-color:rgb(234 179 8 / var(--tw-bg-opacity, 1)) !important}.active\:bg-yellow-600:active{--tw-bg-opacity:1 !important;background-color:rgb(202 138 4 / var(--tw-bg-opacity, 1)) !important}@media (min-width: 640px){.sm\:inline{display:inline !important}}@media (min-width: 768px){.md\:grid-cols-2{grid-template-columns:repeat(2, minmax(0, 1fr)) !important}.md\:text-3xl{font-size:1.875rem !important;line-height:2.25rem !important}}</style></head>
+<body class="bg-yellow-50" id="artifacts-component-root-html">
+
+<!-- 헤더 -->
+<header class="main-header py-6 px-4 shadow-md">
+  <div class="max-w-6xl mx-auto flex items-center gap-4">
+    <div class="w-12 h-12 bg-white rounded-xl flex items-center justify-center shadow-sm">
+      <span class="text-2xl">💄</span>
+    </div>
+    <div>
+      <h1 class="text-2xl md:text-3xl font-black text-gray-900">카카오 톡딜 뷰티 분석 리포트</h1>
+      <p class="text-gray-700 text-sm mt-0.5">📅 데이터 기준일: 2026. 7. 15 (총 89개 상품)</p>
+    </div>
+  </div>
+</header>
+
+<!-- 탭 메뉴 -->
+<div class="bg-white shadow-sm sticky top-0 z-50">
+  <div class="max-w-6xl mx-auto">
+    <div class="flex overflow-x-auto scrollbar-hide">
+      <button class="tab-btn active flex-shrink-0 px-4 py-4 text-sm font-600 text-gray-700 flex items-center gap-2" onclick="switchTab(0)">
+        <i class="fas fa-star text-yellow-500"></i> <span class="hidden sm:inline">최종</span> 인사이트
+      </button>
+      <button class="tab-btn flex-shrink-0 px-4 py-4 text-sm text-gray-700 flex items-center gap-2" onclick="switchTab(1)">
+        <i class="fas fa-tags text-yellow-500"></i> 인기 카테고리
+      </button>
+      <button class="tab-btn flex-shrink-0 px-4 py-4 text-sm text-gray-700 flex items-center gap-2" onclick="switchTab(2)">
+        <i class="fas fa-trophy text-yellow-500"></i> 브랜드 경쟁력
+      </button>
+      <button class="tab-btn flex-shrink-0 px-4 py-4 text-sm text-gray-700 flex items-center gap-2" onclick="switchTab(3)">
+        <i class="fas fa-lightbulb text-yellow-500"></i> 시장 기회
+      </button>
+      <button class="tab-btn flex-shrink-0 px-4 py-4 text-sm text-gray-700 flex items-center gap-2" onclick="switchTab(4)">
+        <i class="fas fa-list text-yellow-500"></i> 카테고리별 TOP10
+      </button>
+      <div class="ml-auto flex items-center px-3">
+        <button onclick="downloadHTML()" class="flex items-center gap-2 bg-yellow-400 hover:bg-yellow-500 active:bg-yellow-600 text-gray-900 font-bold text-sm px-4 py-2 rounded-xl shadow transition-all whitespace-nowrap">
+          <i class="fas fa-download"></i> <span class="hidden sm:inline">HTML 다운로드</span>
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 메인 콘텐츠 -->
+<main class="max-w-6xl mx-auto px-4 py-6 space-y-6">
+
+  <!-- 탭0: 최종 인사이트 -->
+  <div class="tab-content active" id="tab-0">
+    <div class="kakao-card">
+      <h2 class="text-xl font-bold text-gray-900 mb-5 flex items-center gap-2">
+        <span class="text-2xl">🔥</span> 오늘 가장 폭발적으로 팔린 상품 TOP 5
+      </h2>
+      <div id="top5List" class="space-y-3"><div class="flex items-start gap-3 p-3 rounded-xl border border-gray-100 hover:border-yellow-300 transition-all">
+      <div class="rank-badge rank-1">1</div>
+      <div class="flex-1 min-w-0">
+        <p class="font-bold text-gray-900 text-sm leading-tight truncate">물놀이 틴트 추천! (1+1) [리즈 PICK] 퍼펙트립스 쇼킹립 21colors</p>
+        <div class="flex flex-wrap items-center gap-2 mt-1">
+          <span class="text-xs text-gray-500 bg-gray-100 px-2 py-0.5 rounded-full">토니모리</span>
+          <span class="text-xs text-yellow-700 bg-yellow-100 px-2 py-0.5 rounded-full">립</span>
+          <span class="text-xs text-gray-500">⭐ 96%</span>
+        </div>
+        <div class="mt-2">
+          <div class="flex justify-between text-xs mb-1">
+            <span class="font-bold text-gray-800">921개 판매 중</span>
+          </div>
+          <div class="w-full bg-gray-100 rounded-full h-2">
+            <div class="h-2 rounded-full" style="width:100%;background:#FEE500;"></div>
+          </div>
+        </div>
+      </div>
+      <div class="text-right flex-shrink-0">
+        <div class="font-bold text-lg text-gray-900">921</div>
+        <div class="text-xs text-gray-400">구매 중</div>
+        <div class="text-xs font-semibold text-yellow-600 mt-1">₩20,800</div>
+      </div>
+    </div><div class="flex items-start gap-3 p-3 rounded-xl border border-gray-100 hover:border-yellow-300 transition-all">
+      <div class="rank-badge rank-2">2</div>
+      <div class="flex-1 min-w-0">
+        <p class="font-bold text-gray-900 text-sm leading-tight truncate">[풋샴푸] 온더바디 코튼풋 발을씻자 풋샴푸 레몬 385ml 용기 2개+리필 500ml 1개 외 구성</p>
+        <div class="flex flex-wrap items-center gap-2 mt-1">
+          <span class="text-xs text-gray-500 bg-gray-100 px-2 py-0.5 rounded-full">LG생활건강</span>
+          <span class="text-xs text-yellow-700 bg-yellow-100 px-2 py-0.5 rounded-full">샴푸</span>
+          <span class="text-xs text-gray-500">⭐ 100%</span>
+        </div>
+        <div class="mt-2">
+          <div class="flex justify-between text-xs mb-1">
+            <span class="font-bold text-gray-800">852개 판매 중</span>
+          </div>
+          <div class="w-full bg-gray-100 rounded-full h-2">
+            <div class="h-2 rounded-full" style="width:92.50814332247556%;background:#e8e8e8;"></div>
+          </div>
+        </div>
+      </div>
+      <div class="text-right flex-shrink-0">
+        <div class="font-bold text-lg text-gray-900">852</div>
+        <div class="text-xs text-gray-400">구매 중</div>
+        <div class="text-xs font-semibold text-yellow-600 mt-1">₩14,900</div>
+      </div>
+    </div><div class="flex items-start gap-3 p-3 rounded-xl border border-gray-100 hover:border-yellow-300 transition-all">
+      <div class="rank-badge rank-3">3</div>
+      <div class="flex-1 min-w-0">
+        <p class="font-bold text-gray-900 text-sm leading-tight truncate">바이오가 모이스춰 바디워시&amp;헤어</p>
+        <div class="flex flex-wrap items-center gap-2 mt-1">
+          <span class="text-xs text-gray-500 bg-gray-100 px-2 py-0.5 rounded-full">바이오가</span>
+          <span class="text-xs text-yellow-700 bg-yellow-100 px-2 py-0.5 rounded-full">바디워시</span>
+          <span class="text-xs text-gray-500">⭐ 100%</span>
+        </div>
+        <div class="mt-2">
+          <div class="flex justify-between text-xs mb-1">
+            <span class="font-bold text-gray-800">827개 판매 중</span>
+          </div>
+          <div class="w-full bg-gray-100 rounded-full h-2">
+            <div class="h-2 rounded-full" style="width:89.79370249728555%;background:#f4c97a;"></div>
+          </div>
+        </div>
+      </div>
+      <div class="text-right flex-shrink-0">
+        <div class="font-bold text-lg text-gray-900">827</div>
+        <div class="text-xs text-gray-400">구매 중</div>
+        <div class="text-xs font-semibold text-yellow-600 mt-1">₩17,900</div>
+      </div>
+    </div><div class="flex items-start gap-3 p-3 rounded-xl border border-gray-100 hover:border-yellow-300 transition-all">
+      <div class="rank-badge rank-other">4</div>
+      <div class="flex-1 min-w-0">
+        <p class="font-bold text-gray-900 text-sm leading-tight truncate">[마미케어/특대용량] 한의원 실제 입점! 죽은각질 완벽 제거 생율무 효소세안제 + 마스크팩&amp;티슈 추가 증정 / 국내산 100%</p>
+        <div class="flex flex-wrap items-center gap-2 mt-1">
+          <span class="text-xs text-gray-500 bg-gray-100 px-2 py-0.5 rounded-full">마미케어</span>
+          <span class="text-xs text-yellow-700 bg-yellow-100 px-2 py-0.5 rounded-full">마스크</span>
+          <span class="text-xs text-gray-500">⭐ 96%</span>
+        </div>
+        <div class="mt-2">
+          <div class="flex justify-between text-xs mb-1">
+            <span class="font-bold text-gray-800">448개 판매 중</span>
+          </div>
+          <div class="w-full bg-gray-100 rounded-full h-2">
+            <div class="h-2 rounded-full" style="width:48.642779587404995%;background:#d0d0d0;"></div>
+          </div>
+        </div>
+      </div>
+      <div class="text-right flex-shrink-0">
+        <div class="font-bold text-lg text-gray-900">448</div>
+        <div class="text-xs text-gray-400">구매 중</div>
+        <div class="text-xs font-semibold text-yellow-600 mt-1">₩23,900</div>
+      </div>
+    </div><div class="flex items-start gap-3 p-3 rounded-xl border border-gray-100 hover:border-yellow-300 transition-all">
+      <div class="rank-badge rank-other">5</div>
+      <div class="flex-1 min-w-0">
+        <p class="font-bold text-gray-900 text-sm leading-tight truncate">[여름추천템] 풀리 비건 쌀 세라 수분 선크림 50ml 2개</p>
+        <div class="flex flex-wrap items-center gap-2 mt-1">
+          <span class="text-xs text-gray-500 bg-gray-100 px-2 py-0.5 rounded-full">FULLY</span>
+          <span class="text-xs text-yellow-700 bg-yellow-100 px-2 py-0.5 rounded-full">선크림</span>
+          <span class="text-xs text-gray-500">⭐ 100%</span>
+        </div>
+        <div class="mt-2">
+          <div class="flex justify-between text-xs mb-1">
+            <span class="font-bold text-gray-800">347개 판매 중</span>
+          </div>
+          <div class="w-full bg-gray-100 rounded-full h-2">
+            <div class="h-2 rounded-full" style="width:37.67643865363735%;background:#d0d0d0;"></div>
+          </div>
+        </div>
+      </div>
+      <div class="text-right flex-shrink-0">
+        <div class="font-bold text-lg text-gray-900">347</div>
+        <div class="text-xs text-gray-400">구매 중</div>
+        <div class="text-xs font-semibold text-yellow-600 mt-1">₩31,000</div>
+      </div>
+    </div></div>
+    </div>
+
+    <div class="kakao-card">
+      <h2 class="text-xl font-bold text-gray-900 mb-4 flex items-center gap-2">
+        <span class="text-2xl">📊</span> 오늘의 핵심 트렌드 요약
+      </h2>
+      <div id="trendSummary" class="space-y-3">
+    <div class="flex items-start gap-3 p-4 rounded-xl bg-gradient-to-r from-yellow-50 to-white border border-yellow-100">
+      <span class="text-2xl">💅</span>
+      <div>
+        <p class="font-bold text-gray-900 mb-1">색조 제품의 강세</p>
+        <p class="text-gray-600 text-sm leading-relaxed">립/아이제품 중심으로 높은 만족도 기록 중</p>
+      </div>
+    </div>
+  
+    <div class="flex items-start gap-3 p-4 rounded-xl bg-gradient-to-r from-yellow-50 to-white border border-yellow-100">
+      <span class="text-2xl">✨</span>
+      <div>
+        <p class="font-bold text-gray-900 mb-1">스킨케어 시장 확대</p>
+        <p class="text-gray-600 text-sm leading-relaxed">전체의 50% 이상이 스킨케어 제품</p>
+      </div>
+    </div>
+  
+    <div class="flex items-start gap-3 p-4 rounded-xl bg-gradient-to-r from-yellow-50 to-white border border-yellow-100">
+      <span class="text-2xl">🧴</span>
+      <div>
+        <p class="font-bold text-gray-900 mb-1">헤어케어 안정 수요</p>
+        <p class="text-gray-600 text-sm leading-relaxed">헤어케어 제품의 꾸준한 판매량 유지</p>
+      </div>
+    </div>
+  
+    <div class="flex items-start gap-3 p-4 rounded-xl bg-gradient-to-r from-yellow-50 to-white border border-yellow-100">
+      <span class="text-2xl">⭐</span>
+      <div>
+        <p class="font-bold text-gray-900 mb-1">높은 품질 만족도</p>
+        <p class="text-gray-600 text-sm leading-relaxed">대부분 제품이 90% 이상의 만족률 기록</p>
+      </div>
+    </div>
+  
+    <div class="flex items-start gap-3 p-4 rounded-xl bg-gradient-to-r from-yellow-50 to-white border border-yellow-100">
+      <span class="text-2xl">🏆</span>
+      <div>
+        <p class="font-bold text-gray-900 mb-1">강력한 브랜드들</p>
+        <p class="text-gray-600 text-sm leading-relaxed">FULLY, 메디올 등 대형 브랜드 점유율 높음</p>
+      </div>
+    </div>
+  </div>
+    </div>
+
+    <div class="kakao-card">
+      <h2 class="text-xl font-bold text-gray-900 mb-4 flex items-center gap-2">
+        <span class="text-2xl">💡</span> 주목할 이상값 &amp; 기회 상품
+      </h2>
+      <div id="outlierProducts" class="space-y-3">
+    <div class="p-4 rounded-xl border-2 border-blue-200 bg-blue-50">
+      <p class="font-bold text-blue-800 mb-3">🚀 신규 진입 기회 — 판매량 높지만 리뷰 적음</p>
+      <div class="space-y-2">
+        
+          <div class="flex justify-between items-center text-sm bg-white rounded-lg px-3 py-2">
+            <span class="font-medium text-gray-800 truncate mr-2">바이오가 모이스춰 바디워시&amp;헤어...</span>
+            <span class="flex-shrink-0 text-blue-700 font-bold">827개</span>
+          </div>
+        
+          <div class="flex justify-between items-center text-sm bg-white rounded-lg px-3 py-2">
+            <span class="font-medium text-gray-800 truncate mr-2">[여름추천템] 풀리 비건 쌀 세라 수분 선크림 50ml 2개...</span>
+            <span class="flex-shrink-0 text-blue-700 font-bold">347개</span>
+          </div>
+        
+          <div class="flex justify-between items-center text-sm bg-white rounded-lg px-3 py-2">
+            <span class="font-medium text-gray-800 truncate mr-2">[레이 PICK] 풀리 비건 그린 토마토 클레이 팩클렌저 120...</span>
+            <span class="flex-shrink-0 text-blue-700 font-bold">319개</span>
+          </div>
+        
+      </div>
+    </div>
+    <div class="p-4 rounded-xl border-2 border-orange-200 bg-orange-50">
+      <p class="font-bold text-orange-800 mb-3">⭐ 검증된 상품 — 높은 만족률 &amp; 판매량</p>
+      <div class="space-y-2">
+        
+          <div class="flex justify-between items-center text-sm bg-white rounded-lg px-3 py-2">
+            <span class="font-medium text-gray-800 truncate mr-2">물놀이 틴트 추천! (1+1) [리즈 PICK] 퍼펙트립스 쇼킹...</span>
+            <span class="flex-shrink-0 text-orange-700 font-bold">⭐96%</span>
+          </div>
+        
+          <div class="flex justify-between items-center text-sm bg-white rounded-lg px-3 py-2">
+            <span class="font-medium text-gray-800 truncate mr-2">[풋샴푸] 온더바디 코튼풋 발을씻자 풋샴푸 레몬 385ml 용기...</span>
+            <span class="flex-shrink-0 text-orange-700 font-bold">⭐100%</span>
+          </div>
+        
+          <div class="flex justify-between items-center text-sm bg-white rounded-lg px-3 py-2">
+            <span class="font-medium text-gray-800 truncate mr-2">바이오가 모이스춰 바디워시&amp;헤어...</span>
+            <span class="flex-shrink-0 text-orange-700 font-bold">⭐100%</span>
+          </div>
+        
+          <div class="flex justify-between items-center text-sm bg-white rounded-lg px-3 py-2">
+            <span class="font-medium text-gray-800 truncate mr-2">[마미케어/특대용량] 한의원 실제 입점! 죽은각질 완벽 제거 생...</span>
+            <span class="flex-shrink-0 text-orange-700 font-bold">⭐96%</span>
+          </div>
+        
+          <div class="flex justify-between items-center text-sm bg-white rounded-lg px-3 py-2">
+            <span class="font-medium text-gray-800 truncate mr-2">[여름추천템] 풀리 비건 쌀 세라 수분 선크림 50ml 2개...</span>
+            <span class="flex-shrink-0 text-orange-700 font-bold">⭐100%</span>
+          </div>
+        
+      </div>
+    </div>
+  </div>
+    </div>
+  </div>
+
+  <!-- 탭1: 인기 카테고리 -->
+  <div class="tab-content" id="tab-1">
+    <div class="kakao-card">
+      <h2 class="text-xl font-bold text-gray-900 mb-2 flex items-center gap-2">
+        <span class="text-2xl">🏷️</span> 소분류 기준 구매량 TOP 10
+      </h2>
+      <p class="text-gray-500 text-sm mb-6">구매 중 갯수 합산 기준 상위 10개 소분류</p>
+      <div class="bar-container">
+        <canvas id="categoryBarChart"></canvas>
+      </div>
+    </div>
+    <div class="kakao-card mt-4">
+      <h2 class="text-lg font-bold text-gray-900 mb-4">소분류별 상세 통계</h2>
+      <div class="table-scroll">
+        <table class="data-table" id="categoryTable"></table>
+      </div>
+    </div>
+  </div>
+
+  <!-- 탭2: 브랜드 경쟁력 -->
+  <div class="tab-content" id="tab-2">
+    <div class="grid md:grid-cols-2 gap-6">
+      <div class="kakao-card">
+        <h2 class="text-xl font-bold text-gray-900 mb-2 flex items-center gap-2">
+          <span class="text-2xl">🏆</span> 브랜드 점유율 TOP 10
+        </h2>
+        <p class="text-gray-500 text-sm mb-4">구매 중 갯수 기준</p>
+        <div style="position:relative;height:320px;">
+          <canvas id="brandDonutChart"></canvas>
+        </div>
+      </div>
+      <div class="kakao-card">
+        <h2 class="text-xl font-bold text-gray-900 mb-2 flex items-center gap-2">
+          <span class="text-2xl">⭐</span> 브랜드 리뷰 분석
+        </h2>
+        <p class="text-gray-500 text-sm mb-4">평균 리뷰 만족률 (리뷰 10건 이상만)</p>
+        <div style="position:relative;height:320px;">
+          <canvas id="brandReviewChart"></canvas>
+        </div>
+      </div>
+    </div>
+    <div class="kakao-card mt-4">
+      <h2 class="text-lg font-bold text-gray-900 mb-4">브랜드별 상세 분석표</h2>
+      <div class="table-scroll">
+        <table class="data-table" id="brandTable"></table>
+      </div>
+    </div>
+  </div>
+
+  <!-- 탭3: 시장 기회 -->
+  <div class="tab-content" id="tab-3">
+    <div class="kakao-card">
+      <h2 class="text-xl font-bold text-gray-900 mb-2 flex items-center gap-2">
+        <span class="text-2xl">🎯</span> 시장 기회 산점도
+      </h2>
+      <p class="text-gray-500 text-sm mb-1">X축: 리뷰 수 &nbsp;|&nbsp; Y축: 구매 중 갯수 &nbsp;|&nbsp; 버블 크기: 리뷰 만족률</p>
+      <div class="flex flex-wrap gap-3 mb-4 mt-3">
+        <span class="flex items-center gap-1 text-sm"><span class="inline-block w-3 h-3 rounded-full bg-blue-400"></span> 신규 진입 기회</span>
+        <span class="flex items-center gap-1 text-sm"><span class="inline-block w-3 h-3 rounded-full bg-green-400"></span> 검증된 인기</span>
+      </div>
+      <div style="position:relative;height:480px;">
+        <canvas id="opportunityBubbleChart"></canvas>
+      </div>
+    </div>
+    <div class="grid md:grid-cols-2 gap-6 mt-4">
+      <div class="kakao-card border-2 border-blue-200">
+        <h3 class="font-bold text-blue-700 mb-3 flex items-center gap-2">
+          <i class="fas fa-rocket"></i> 신규 진입 기회 상품
+          <span class="badge-new">판매높음 · 리뷰적음</span>
+        </h3>
+        <div id="newOpportunityList" class="space-y-2"></div>
+      </div>
+      <div class="kakao-card border-2 border-green-200">
+        <h3 class="font-bold text-green-700 mb-3 flex items-center gap-2">
+          <i class="fas fa-shield-alt"></i> 검증된 인기 상품
+          <span class="badge-verified">판매높음 · 만족률높음</span>
+        </h3>
+        <div id="verifiedList" class="space-y-2"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 탭4: 카테고리별 TOP10 -->
+  <div class="tab-content" id="tab-4">
+    <div class="kakao-card">
+      <h2 class="text-xl font-bold text-gray-900 mb-4 flex items-center gap-2">
+        <span class="text-2xl">📋</span> 대분류별 상품 TOP 10 리스트
+      </h2>
+      <div class="flex flex-wrap gap-2 mb-6" id="categorySubTabs"></div>
+      <div class="table-scroll">
+        <table class="data-table" id="top10Table"></table>
+      </div>
+    </div>
+  </div>
+
+</main>
+
+<footer class="text-center py-6 text-gray-400 text-sm mt-4">
+  <p>📊 카카오 톡딜 뷰티 분석 리포트 | Chart.js 기반 시각화</p>
+</footer>
+
+<script>
+// 데이터
+const rawData = [{"date": "2026-07-15", "brand": "토니모리", "product": "물놀이 틴트 추천! (1+1) [리즈 PICK] 퍼펙트립스 쇼킹립 21colors", "category": "색조", "subCategory": "립", "price": 20800, "maxPrice": 19800, "reviewRate": 96, "reviewCount": 796, "salesCount": 921}, {"date": "2026-07-15", "brand": "LG생활건강", "product": "[풋샴푸] 온더바디 코튼풋 발을씻자 풋샴푸 레몬 385ml 용기 2개+리필 500ml 1개 외 구성", "category": "헤어케어", "subCategory": "샴푸", "price": 14900, "maxPrice": 13900, "reviewRate": 100, "reviewCount": 2949, "salesCount": 852}, {"date": "2026-07-15", "brand": "바이오가", "product": "바이오가 모이스춰 바디워시&헤어", "category": "바디케어", "subCategory": "바디워시", "price": 17900, "maxPrice": 0, "reviewRate": 100, "reviewCount": 27, "salesCount": 827}, {"date": "2026-07-15", "brand": "마미케어", "product": "[마미케어/특대용량] 한의원 실제 입점! 죽은각질 완벽 제거 생율무 효소세안제 + 마스크팩&티슈 추가 증정 / 국내산 100%", "category": "스킨케어", "subCategory": "마스크", "price": 23900, "maxPrice": 22900, "reviewRate": 96, "reviewCount": 865, "salesCount": 448}, {"date": "2026-07-15", "brand": "FULLY", "product": "[여름추천템] 풀리 비건 쌀 세라 수분 선크림 50ml 2개", "category": "스킨케어", "subCategory": "선크림", "price": 31000, "maxPrice": 30000, "reviewRate": 100, "reviewCount": 21, "salesCount": 347}, {"date": "2026-07-15", "brand": "FULLY", "product": "[레이 PICK] 풀리 비건 그린 토마토 클레이 팩클렌저 120ml 3개", "category": "스킨케어", "subCategory": "마스크", "price": 48000, "maxPrice": 47000, "reviewRate": 99, "reviewCount": 98, "salesCount": 319}, {"date": "2026-07-15", "brand": "메디올", "product": "[1+1] 메디올 두피청정 샴푸 트리트먼트 외 전품목", "category": "헤어케어", "subCategory": "샴푸", "price": 39600, "maxPrice": 37620, "reviewRate": 97, "reviewCount": 437, "salesCount": 221}, {"date": "2026-07-15", "brand": "CKD guaranteed", "product": "[기미SET]CKD 비타씨테카 토닝샷 기미세럼 30ml+기미잡티샷 마스크 34g 외", "category": "스킨케어", "subCategory": "토너", "price": 10900, "maxPrice": 9900, "reviewRate": 98, "reviewCount": 358, "salesCount": 285}, {"date": "2026-07-15", "brand": "FULLY", "product": "[카카오특가] 풀리 비건 그린 토마토 세럼 30ml 1개", "category": "스킨케어", "subCategory": "세럼", "price": 9000, "maxPrice": 8000, "reviewRate": 0, "reviewCount": 2, "salesCount": 124}, {"date": "2026-07-15", "brand": "09shopping", "product": "(면세점제품) VANT36.5 승무원쿠션 광채물광 파운데이션팩트 (21호 라이트베이지) 미백 주름개선 파운데이션을 한번에", "category": "스킨케어", "subCategory": "마스크", "price": 17900, "maxPrice": 16900, "reviewRate": 94, "reviewCount": 366, "salesCount": 95}, {"date": "2026-07-15", "brand": "THE FACE SHOP", "product": "[2ea] 더페이스샵 보들보들 때필링 300ml", "category": "클렌징", "subCategory": "필링", "price": 12000, "maxPrice": 0, "reviewRate": 0, "reviewCount": 2, "salesCount": 95}, {"date": "2026-07-15", "brand": "리르화장품", "product": "TRANEX 트라넥삼산 기미잡티 멜라토닝 멜라딘 기미크림 1+1 총2개", "category": "스킨케어", "subCategory": "토너", "price": 9900, "maxPrice": 0, "reviewRate": 100, "reviewCount": 320, "salesCount": 119}, {"date": "2026-07-15", "brand": "마미케어", "product": "[마미케어/특대용량] 푸석푸석 거친 피부결 환생! 생율무 영양크림 단독 구성  / 100% 국내산 율무 사용 요철개선", "category": "스킨케어", "subCategory": "크림", "price": 18900, "maxPrice": 17900, "reviewRate": 98, "reviewCount": 309, "salesCount": 63}, {"date": "2026-07-15", "brand": "FULLY", "product": "[카카오특가] 풀리 비건 그린 토마토 토너 250ml 1개", "category": "스킨케어", "subCategory": "토너", "price": 9000, "maxPrice": 8000, "reviewRate": 0, "reviewCount": 2, "salesCount": 76}, {"date": "2026-07-15", "brand": "FULLY", "product": "풀리 비건 그린 토마토 클레이 팩클렌저 120ml 1개", "category": "스킨케어", "subCategory": "마스크", "price": 18900, "maxPrice": 17900, "reviewRate": 100, "reviewCount": 30, "salesCount": 62}, {"date": "2026-07-15", "brand": "블루마틴", "product": "[품절대란] 베르니엘 이너퍼퓸 특가", "category": "향수", "subCategory": "향수", "price": 26800, "maxPrice": 0, "reviewRate": 100, "reviewCount": 36, "salesCount": 56}, {"date": "2026-07-15", "brand": "유스맥스", "product": "[1+1+1+1] 삼각 오토 아이브로우 눈썹펜슬(총4개)", "category": "색조", "subCategory": "아이", "price": 6900, "maxPrice": 0, "reviewRate": 98, "reviewCount": 254, "salesCount": 51}, {"date": "2026-07-15", "brand": "엔끌라", "product": "[1+1] 캐롤프랑크 이드라럭스 크림 100ml", "category": "스킨케어", "subCategory": "크림", "price": 14900, "maxPrice": 0, "reviewRate": 0, "reviewCount": 1, "salesCount": 49}, {"date": "2026-07-15", "brand": "FULLY", "product": "풀리 비건 그린 토마토 클렌징 오일 250ml 2개", "category": "스킨케어", "subCategory": "기타", "price": 24000, "maxPrice": 23000, "reviewRate": 0, "reviewCount": 0, "salesCount": 37}, {"date": "2026-07-15", "brand": "메디플라워", "product": "시카 마일드 저자극 폼클렌징 150mlx4개/클렌징폼", "category": "클렌징", "subCategory": "폼클렌징", "price": 11900, "maxPrice": 0, "reviewRate": 99, "reviewCount": 2309, "salesCount": 39}, {"date": "2026-07-15", "brand": "FULLY", "product": "풀리 비건 그린 토마토 크림 90ml 튜브형 2개", "category": "스킨케어", "subCategory": "크림", "price": 18000, "maxPrice": 17000, "reviewRate": 0, "reviewCount": 7, "salesCount": 42}, {"date": "2026-07-15", "brand": "FULLY", "product": "풀리 비건 쌀 세라 수분 선크림 50ml 1개", "category": "스킨케어", "subCategory": "선크림", "price": 17900, "maxPrice": 16900, "reviewRate": 0, "reviewCount": 1, "salesCount": 31}, {"date": "2026-07-15", "brand": "마켓코리아", "product": "[셀트리온스킨큐어] 셀린온 피디알엔 PDRN 인퓨즈 스킨케어 7종세트 / 다크케어아이솔루션 증정(+쇼핑백)", "category": "스킨케어", "subCategory": "기타", "price": 59900, "maxPrice": 59800, "reviewRate": 99, "reviewCount": 90, "salesCount": 32}, {"date": "2026-07-15", "brand": "912", "product": "[단품 기획] 912 니치향수 모음 오드퍼퓸 (EDP) 40ml 살냄새 지속력좋은 오래가는 우디향 코튼향 향수", "category": "향수", "subCategory": "향수", "price": 11000, "maxPrice": 0, "reviewRate": 0, "reviewCount": 2, "salesCount": 65}, {"date": "2026-07-15", "brand": "FULLY", "product": "풀리 비건 그린 토마토 크림 90ml 1개 (튜브형/단지형)", "category": "스킨케어", "subCategory": "크림", "price": 10900, "maxPrice": 9900, "reviewRate": 0, "reviewCount": 0, "salesCount": 23}, {"date": "2026-07-15", "brand": "메디플라워", "product": "에트투스 아르간/바오밥 트리트먼트 1000ml/헤어팩/손상모발 케어", "category": "스킨케어", "subCategory": "마스크", "price": 11900, "maxPrice": 0, "reviewRate": 99, "reviewCount": 8934, "salesCount": 26}, {"date": "2026-07-15", "brand": "유스맥스", "product": "[1+1] 오드 퍼퓸 아르간 헤어오일 100ml(로즈/화이트머스크)", "category": "스킨케어", "subCategory": "기타", "price": 12900, "maxPrice": 0, "reviewRate": 94, "reviewCount": 100, "salesCount": 20}, {"date": "2026-07-15", "brand": "유스맥스", "product": "[정샘물] 스킨 누더/롱웨어/커버레이어 쿠션(본품+리필)외 물미스트 [100%정품]", "category": "스킨케어", "subCategory": "기타", "price": 27900, "maxPrice": 0, "reviewRate": 100, "reviewCount": 75, "salesCount": 19}, {"date": "2026-07-15", "brand": "라퓨레브", "product": "행사 100% Gift지급 [5개세트] 라퓨레브 UV 투명선크림 spf50+ pa+++ KFDA 3중 유기자 무기자 혼합자차", "category": "스킨케어", "subCategory": "선크림", "price": 15990, "maxPrice": 14400, "reviewRate": 99, "reviewCount": 248, "salesCount": 17}, {"date": "2026-07-15", "brand": "살림백서", "product": "퓨어 마이크로 휩 폼클렌징 230ml 4개 대용량 촉촉한 미세거품 클렌징폼 모공 피지 각질제거", "category": "클렌징", "subCategory": "폼클렌징", "price": 12900, "maxPrice": 0, "reviewRate": 99, "reviewCount": 93, "salesCount": 17}, {"date": "2026-07-15", "brand": "유스맥스", "product": "뽑아쓰는 진정 시카 카밍 마스크팩 350g(30매)", "category": "스킨케어", "subCategory": "마스크", "price": 9900, "maxPrice": 0, "reviewRate": 100, "reviewCount": 54, "salesCount": 18}, {"date": "2026-07-15", "brand": "유스맥스", "product": "[장당 330원] 리얼 에센스 마스크팩 30매 15종 한달패키지", "category": "스킨케어", "subCategory": "세럼", "price": 9900, "maxPrice": 0, "reviewRate": 96, "reviewCount": 24, "salesCount": 51}, {"date": "2026-07-15", "brand": "매치스라이프", "product": "[저자극 테스트 완료] 1+1 메르헨트 맥주효모 탈모샴푸 1L 대용량 약산성 바이오틴 정수리냄새 지성 건성 두피 케어", "category": "헤어케어", "subCategory": "샴푸", "price": 19900, "maxPrice": 0, "reviewRate": 99, "reviewCount": 802, "salesCount": 21}, {"date": "2026-07-15", "brand": "로즈마인", "product": "[바스파] 힐링에 힐링을 더하다 호주산 천일염 스크럽 바디워시 1000ml", "category": "바디케어", "subCategory": "바디워시", "price": 12900, "maxPrice": 0, "reviewRate": 99, "reviewCount": 148, "salesCount": 24}, {"date": "2026-07-15", "brand": "살림백서", "product": "1+1 살림백서 대용량 바디로션 라이스&허브 1000ml 향좋은 퍼퓸 고보습 촉촉한", "category": "스킨케어", "subCategory": "기타", "price": 12900, "maxPrice": 0, "reviewRate": 98, "reviewCount": 120, "salesCount": 16}, {"date": "2026-07-15", "brand": "스타일셀러", "product": "하이클 데일리 결케어 SET (라하세럼+젤클렌저) 피지삭제 / 매끈촉촉 / 화잘먹템", "category": "스킨케어", "subCategory": "세럼", "price": 13900, "maxPrice": 13205, "reviewRate": 0, "reviewCount": 0, "salesCount": 17}, {"date": "2026-07-15", "brand": "메디플라워", "product": "에트투스 아로마 그린 탈모샴푸 500ml 1+1/카카오특가", "category": "헤어케어", "subCategory": "샴푸", "price": 13900, "maxPrice": 0, "reviewRate": 97, "reviewCount": 4308, "salesCount": 14}, {"date": "2026-07-15", "brand": "매치스라이프", "product": "1+1 메르헨트 대용량 바디워시 1500ml 대용량 약산성 바디클렌저 모음전 향기 향좋은", "category": "클렌징", "subCategory": "기타", "price": 19900, "maxPrice": 0, "reviewRate": 98, "reviewCount": 1201, "salesCount": 15}, {"date": "2026-07-15", "brand": "FULLY", "product": "풀리 비건 그린 토마토 클렌징 오일 250ml 1개", "category": "스킨케어", "subCategory": "기타", "price": 13900, "maxPrice": 12900, "reviewRate": 0, "reviewCount": 0, "salesCount": 13}, {"date": "2026-07-15", "brand": "로즈마인", "product": "[프레쥬] 1+1 싱그러운 자연약쑥 촉촉 수분 진정 닦토 대용량 토너 500ml", "category": "스킨케어", "subCategory": "토너", "price": 14900, "maxPrice": 13900, "reviewRate": 99, "reviewCount": 1105, "salesCount": 13}, {"date": "2026-07-15", "brand": "매치스라이프", "product": "[체취감소 66% 개선] 1+1+1 센티베르 퍼퓸 바디워시 1L 대용량 바디클렌저 약산성 향기좋은", "category": "클렌징", "subCategory": "기타", "price": 21900, "maxPrice": 20900, "reviewRate": 100, "reviewCount": 28, "salesCount": 14}, {"date": "2026-07-15", "brand": "로즈마인", "product": "[입소문템] 1+1+1 향기 루틴 로에랑스 명품향수 대용량 퍼퓸 바디미스트 250ml", "category": "바디케어", "subCategory": "기타", "price": 19900, "maxPrice": 0, "reviewRate": 100, "reviewCount": 18, "salesCount": 13}, {"date": "2026-07-15", "brand": "메디플라워", "product": "보니타 가든 핸드크림 6종세트/5+1덤/보습크림/보습선물", "category": "스킨케어", "subCategory": "크림", "price": 9900, "maxPrice": 0, "reviewRate": 99, "reviewCount": 5053, "salesCount": 13}, {"date": "2026-07-15", "brand": "유니픽쳐x프롱화장품", "product": "(1+1+가이드) 프롱 착타투 5D 아이브로우 펜/ 10일지속 임상테스트 완료", "category": "색조", "subCategory": "아이", "price": 9900, "maxPrice": 0, "reviewRate": 90, "reviewCount": 188, "salesCount": 13}, {"date": "2026-07-15", "brand": "JVELY", "product": "[1+1+1] 앙쥬 나의 시카 필링젤 + 사은품 3종", "category": "클렌징", "subCategory": "필링", "price": 12900, "maxPrice": 12800, "reviewRate": 98, "reviewCount": 65, "salesCount": 12}, {"date": "2026-07-15", "brand": "09shopping", "product": "VANT36.5수분크림 대용량(100ml) 백화점입점", "category": "스킨케어", "subCategory": "크림", "price": 14900, "maxPrice": 13900, "reviewRate": 98, "reviewCount": 44, "salesCount": 11}, {"date": "2026-07-15", "brand": "유니비키", "product": "깔끔 간편 반달눈썹정리세트", "category": "색조", "subCategory": "아이", "price": 4900, "maxPrice": 0, "reviewRate": 0, "reviewCount": 9, "salesCount": 12}, {"date": "2026-07-15", "brand": "엔끌라", "product": "[1+1] 캐롤프랑크 이드라럭스 세럼 50ml", "category": "스킨케어", "subCategory": "세럼", "price": 14900, "maxPrice": 0, "reviewRate": 0, "reviewCount": 0, "salesCount": 10}, {"date": "2026-07-15", "brand": "메디플라워", "product": "알로에베라 수딩젤 98% 300mlx5개/피부진정/수분공급", "category": "스킨케어", "subCategory": "기타", "price": 10900, "maxPrice": 0, "reviewRate": 99, "reviewCount": 2234, "salesCount": 0}, {"date": "2026-07-15", "brand": "로즈마인", "product": "[입소문템]1+1향기 루틴 로에랑스 명품향수 대용량 퍼퓸 바디미스트  250ml", "category": "바디케어", "subCategory": "기타", "price": 14900, "maxPrice": 0, "reviewRate": 96, "reviewCount": 1461, "salesCount": 11}, {"date": "2026-07-15", "brand": "메디플라워", "product": "피부진정 스킨 마스크팩 40매 (종류 택2)", "category": "스킨케어", "subCategory": "마스크", "price": 14900, "maxPrice": 0, "reviewRate": 95, "reviewCount": 480, "salesCount": 11}, {"date": "2026-07-15", "brand": "유스맥스", "product": "[1+1] AHC 내추럴 퍼펙션 더블쉴드 선스틱(사계절/워터프루프/골프)", "category": "기타뷰티", "subCategory": "기타", "price": 17500, "maxPrice": 0, "reviewRate": 97, "reviewCount": 66, "salesCount": 10}, {"date": "2026-07-15", "brand": "유스맥스", "product": "미샤 퍼펙트 커버 비비크림 50ml BB크림", "category": "스킨케어", "subCategory": "크림", "price": 7500, "maxPrice": 0, "reviewRate": 97, "reviewCount": 235, "salesCount": 10}, {"date": "2026-07-15", "brand": "메디플라워", "product": "대용량 히알루론산 폼클렌징 150mlx4개/순한 저자극 클렌징폼", "category": "클렌징", "subCategory": "폼클렌징", "price": 11900, "maxPrice": 0, "reviewRate": 99, "reviewCount": 109, "salesCount": 10}, {"date": "2026-07-15", "brand": "메디플라워", "product": "콜라겐 링클 아이크림40mlx4 (총4개)/주름개선 기능성", "category": "스킨케어", "subCategory": "크림", "price": 11900, "maxPrice": 0, "reviewRate": 99, "reviewCount": 5930, "salesCount": 0}, {"date": "2026-07-15", "brand": "메디플라워", "product": "대용량 엠보싱 화장솜 300매x3박스(총900매)/순면 100%", "category": "기타뷰티", "subCategory": "기타", "price": 11900, "maxPrice": 0, "reviewRate": 98, "reviewCount": 3981, "salesCount": 0}, {"date": "2026-07-15", "brand": "메디플라워", "product": "에트투스 아르간 샴푸/바디워시/바디로션 1000ml (1+1)/총2000ml", "category": "스킨케어", "subCategory": "기타", "price": 15900, "maxPrice": 0, "reviewRate": 98, "reviewCount": 1095, "salesCount": 0}, {"date": "2026-07-15", "brand": "매치스라이프", "product": "1+1 메르헨트 바세린 바디로션 1000ml 대용량 향좋은 고보습 향오래가는", "category": "스킨케어", "subCategory": "기타", "price": 15900, "maxPrice": 0, "reviewRate": 97, "reviewCount": 260, "salesCount": 0}, {"date": "2026-07-15", "brand": "로즈마인", "product": "[체험특가]샤샤 아르간오일 고농축 손상보호 헤어세럼 200ml / 헤어에센스 250ml / 헤어 스프레이 250ml", "category": "스킨케어", "subCategory": "세럼", "price": 9900, "maxPrice": 0, "reviewRate": 99, "reviewCount": 186, "salesCount": 0}, {"date": "2026-07-15", "brand": "매치스라이프", "product": "1+1 메르헨트 퍼퓸 대용량 바디워시 1L 약산성 향기좋은 바디클렌져 바디샤워", "category": "바디케어", "subCategory": "바디워시", "price": 14900, "maxPrice": 0, "reviewRate": 98, "reviewCount": 132, "salesCount": 0}, {"date": "2026-07-15", "brand": "스팟세일", "product": "앙쥬 인생 블랙쿠션 (본품1개+리필1개)", "category": "색조", "subCategory": "쿠션", "price": 12900, "maxPrice": 12800, "reviewRate": 98, "reviewCount": 41, "salesCount": 0}, {"date": "2026-07-15", "brand": "살림장만", "product": "아이깨끗해 랩신 컬러체인지 핸드워시 손세정제 리필 기획전 200ml 250ml", "category": "기타뷰티", "subCategory": "기타", "price": 1590, "maxPrice": 0, "reviewRate": 100, "reviewCount": 34, "salesCount": 43}, {"date": "2026-07-15", "brand": "스팟세일", "product": "[1+1] 아스파시아 제주 그린티 톤업 선크림", "category": "스킨케어", "subCategory": "선크림", "price": 9900, "maxPrice": 9800, "reviewRate": 100, "reviewCount": 21, "salesCount": 0}, {"date": "2026-07-15", "brand": "나후마켓", "product": "닥터포헤어 폴리젠 샴푸 750ml x 2 +100ml x 2 대용량", "category": "헤어케어", "subCategory": "샴푸", "price": 38900, "maxPrice": 0, "reviewRate": 100, "reviewCount": 17, "salesCount": 0}, {"date": "2026-07-15", "brand": "엔끌라", "product": "캐롤프랑크 프랑스 직수입 녹터널 마스크 100ml", "category": "스킨케어", "subCategory": "마스크", "price": 19900, "maxPrice": 0, "reviewRate": 0, "reviewCount": 3, "salesCount": 0}, {"date": "2026-07-15", "brand": "바디브", "product": "바디브 대용량 1000ml 샴푸 트리트먼트 바디워시 외 헤어바디 전품목", "category": "바디케어", "subCategory": "바디워시", "price": 14900, "maxPrice": 0, "reviewRate": 100, "reviewCount": 1099, "salesCount": 19}, {"date": "2026-07-15", "brand": "메디플라워", "product": "약산성 어성초 토너패드&센텔라 필링패드/대용량 60매/보습/진정패드", "category": "스킨케어", "subCategory": "토너", "price": 9900, "maxPrice": 0, "reviewRate": 99, "reviewCount": 387, "salesCount": 0}, {"date": "2026-07-15", "brand": "푸르내음", "product": "백화점 여자남자향수 특가 모음전 랑방 버버리 ck 존바바토스 몽블랑 지미추 페라리 클린 외", "category": "향수", "subCategory": "향수", "price": 45900, "maxPrice": 45400, "reviewRate": 97, "reviewCount": 230, "salesCount": 10}, {"date": "2026-07-15", "brand": "아미코리아", "product": "모약돌 샴푸바 85g 고체 샴푸 비누 트리트먼트바", "category": "헤어케어", "subCategory": "샴푸", "price": 7900, "maxPrice": 0, "reviewRate": 99, "reviewCount": 145, "salesCount": 23}, {"date": "2026-07-15", "brand": "엔끌라", "product": "[1+1+1] 뉴트라덤 프랑스 직수입 온가족 올인원 크림 (사용기한 26년 9월 1일)", "category": "스킨케어", "subCategory": "크림", "price": 5900, "maxPrice": 0, "reviewRate": 100, "reviewCount": 109, "salesCount": 0}, {"date": "2026-07-15", "brand": "매치스라이프", "product": "[체취감소 66% 개선] 1+1 센티베르 퍼퓸 바디워시 1L 대용량 바디클렌저 약산성 향기좋은", "category": "클렌징", "subCategory": "기타", "price": 15900, "maxPrice": 0, "reviewRate": 100, "reviewCount": 26, "salesCount": 0}, {"date": "2026-07-15", "brand": "지아자", "product": "지아자 산양유 바디워시 & 바디로션 세트", "category": "스킨케어", "subCategory": "기타", "price": 10900, "maxPrice": 9900, "reviewRate": 100, "reviewCount": 19, "salesCount": 0}, {"date": "2026-07-15", "brand": "푸르내음", "product": "에스티로더 플레저 우먼 EDP 30ml 50ml", "category": "향수", "subCategory": "향수", "price": 33500, "maxPrice": 0, "reviewRate": 94, "reviewCount": 16, "salesCount": 0}, {"date": "2026-07-15", "brand": "엔끌라", "product": "[1+1+1] 셀라보 워터 다이브 선스틱 25g", "category": "기타뷰티", "subCategory": "기타", "price": 12900, "maxPrice": 0, "reviewRate": 0, "reviewCount": 5, "salesCount": 0}, {"date": "2026-07-15", "brand": "블라세아", "product": "1+1 블라세아 아르간 오일 헤어에센스 100ml", "category": "스킨케어", "subCategory": "세럼", "price": 23500, "maxPrice": 0, "reviewRate": 100, "reviewCount": 1383, "salesCount": 0}, {"date": "2026-07-15", "brand": "수지코리아", "product": "(쇼핑백증정)앙쥬 24K골드 8종세트 외 인기상품 모음전", "category": "기타뷰티", "subCategory": "기타", "price": 39900, "maxPrice": 0, "reviewRate": 98, "reviewCount": 384, "salesCount": 10}, {"date": "2026-07-15", "brand": "메디플라워", "product": "그래놀라 곡물 클렌징티슈 100매x3 (총3개)/순한곡물성분", "category": "클렌징", "subCategory": "기타", "price": 10900, "maxPrice": 0, "reviewRate": 98, "reviewCount": 304, "salesCount": 0}, {"date": "2026-07-15", "brand": "로샵", "product": "헤드앤숄더 가려운두피 샴푸 550ml x3개 외 쿨멘솔 애플프레쉬 모음전", "category": "헤어케어", "subCategory": "샴푸", "price": 19900, "maxPrice": 0, "reviewRate": 96, "reviewCount": 55, "salesCount": 0}, {"date": "2026-07-15", "brand": "유스맥스", "product": "[1+1] 번짐없는 펜 아이라이너 슈퍼슬림 워터프루프 리퀴드 붓펜", "category": "색조", "subCategory": "아이", "price": 8900, "maxPrice": 0, "reviewRate": 100, "reviewCount": 14, "salesCount": 0}, {"date": "2026-07-15", "brand": "바라스토어", "product": "[1+1+1] 태국 야돔 파이쿠 인헤일러 코막힘 코뻥", "category": "기타뷰티", "subCategory": "기타", "price": 7800, "maxPrice": 0, "reviewRate": 0, "reviewCount": 5, "salesCount": 0}, {"date": "2026-07-15", "brand": "매치스라이프", "product": "메르헨트 바세린 바디로션 1000ml X 1개 대용량 향좋은 고보습 향오래가는", "category": "스킨케어", "subCategory": "기타", "price": 7900, "maxPrice": 0, "reviewRate": 0, "reviewCount": 5, "salesCount": 0}, {"date": "2026-07-15", "brand": "살림하기 좋은 날", "product": "[레이데이]바르는 연어주사! PDRN 리페어크림 1+1+1 / 수분장벽 판테놀 크림 수분크림 탄력크림", "category": "스킨케어", "subCategory": "크림", "price": 13900, "maxPrice": 0, "reviewRate": 0, "reviewCount": 5, "salesCount": 0}, {"date": "2026-07-15", "brand": "메디플라워", "product": "메디플라워 대용량 모델링팩 1kg(40회분) 9종 택1/피부샵 모델링팩/마스크팩", "category": "스킨케어", "subCategory": "마스크", "price": 11900, "maxPrice": 0, "reviewRate": 98, "reviewCount": 1122, "salesCount": 0}, {"date": "2026-07-15", "brand": "메디플라워", "product": "(1+1+1)보니타 가든 바디워시/바디로션/클렌저 500ml 특가 모음", "category": "스킨케어", "subCategory": "기타", "price": 15900, "maxPrice": 0, "reviewRate": 99, "reviewCount": 485, "salesCount": 0}, {"date": "2026-07-15", "brand": "로즈마인", "product": "[페디슨] 1+1 저자극 여성 청결제 액상형 300ml & 거품형 200ml", "category": "기타뷰티", "subCategory": "기타", "price": 10900, "maxPrice": 0, "reviewRate": 99, "reviewCount": 278, "salesCount": 0}, {"date": "2026-07-15", "brand": "수지코리아", "product": "(1+1+1) 판테놀+센텔라폭탄!! 마데퓨어 리페어크림 50ml*3개", "category": "스킨케어", "subCategory": "크림", "price": 12900, "maxPrice": 0, "reviewRate": 99, "reviewCount": 147, "salesCount": 0}, {"date": "2026-07-15", "brand": "로샵", "product": "케라시스 퍼퓸 샴푸 화이트 데이지 1000ml 향기좋은 사춘기 냄새 정수리 청소년", "category": "헤어케어", "subCategory": "샴푸", "price": 5200, "maxPrice": 0, "reviewRate": 100, "reviewCount": 38, "salesCount": 21}, {"date": "2026-07-15", "brand": "쇼핑욜로", "product": "묻어남없는 48시간 워터프루프 문신 립스틱! [앙쥬]입술문신 반전립스틱 3.5g", "category": "색조", "subCategory": "립", "price": 6500, "maxPrice": 0, "reviewRate": 96, "reviewCount": 24, "salesCount": 0}, {"date": "2026-07-15", "brand": "지아자", "product": "[1+1] 폴란드 NO.1 지아자 산양유 데이크림 50ml 화잘먹 수분크림 / 나이트크림 / 토너", "category": "스킨케어", "subCategory": "토너", "price": 13900, "maxPrice": 12900, "reviewRate": 100, "reviewCount": 23, "salesCount": 12}];
+const subCatData = {"립": {"sales": 921, "avgReview": 96, "count": 2, "totalReviews": 820}, "샴푸": {"sales": 1152, "avgReview": 98, "count": 8, "totalReviews": 8751}, "바디워시": {"sales": 870, "avgReview": 99, "count": 4, "totalReviews": 1406}, "마스크": {"sales": 979, "avgReview": 98, "count": 9, "totalReviews": 11952}, "선크림": {"sales": 395, "avgReview": 100, "count": 4, "totalReviews": 291}, "토너": {"sales": 505, "avgReview": 99, "count": 6, "totalReviews": 2195}, "세럼": {"sales": 202, "avgReview": 98, "count": 6, "totalReviews": 1595}, "필링": {"sales": 107, "avgReview": 98, "count": 2, "totalReviews": 67}, "크림": {"sales": 211, "avgReview": 99, "count": 11, "totalReviews": 11840}, "향수": {"sales": 131, "avgReview": 97, "count": 4, "totalReviews": 284}, "아이": {"sales": 76, "avgReview": 96, "count": 4, "totalReviews": 465}, "기타": {"sales": 253, "avgReview": 98, "count": 25, "totalReviews": 12274}, "폼클렌징": {"sales": 66, "avgReview": 99, "count": 3, "totalReviews": 2511}, "쿠션": {"sales": 0, "avgReview": 98, "count": 1, "totalReviews": 41}};
+const brandData = {"토니모리": {"sales": 921, "avgReview": 96, "count": 1, "totalReviews": 796}, "LG생활건강": {"sales": 852, "avgReview": 100, "count": 1, "totalReviews": 2949}, "바이오가": {"sales": 827, "avgReview": 100, "count": 1, "totalReviews": 27}, "마미케어": {"sales": 511, "avgReview": 97, "count": 2, "totalReviews": 1174}, "FULLY": {"sales": 1074, "avgReview": 100, "count": 10, "totalReviews": 161}, "메디올": {"sales": 221, "avgReview": 97, "count": 1, "totalReviews": 437}, "CKD guaranteed": {"sales": 285, "avgReview": 98, "count": 1, "totalReviews": 358}, "09shopping": {"sales": 106, "avgReview": 96, "count": 2, "totalReviews": 410}, "THE FACE SHOP": {"sales": 95, "avgReview": 0, "count": 1, "totalReviews": 2}, "리르화장품": {"sales": 119, "avgReview": 100, "count": 1, "totalReviews": 320}, "블루마틴": {"sales": 56, "avgReview": 100, "count": 1, "totalReviews": 36}, "유스맥스": {"sales": 179, "avgReview": 98, "count": 8, "totalReviews": 822}, "엔끌라": {"sales": 59, "avgReview": 100, "count": 5, "totalReviews": 118}, "메디플라워": {"sales": 113, "avgReview": 98, "count": 14, "totalReviews": 36731}, "마켓코리아": {"sales": 32, "avgReview": 99, "count": 1, "totalReviews": 90}, "912": {"sales": 65, "avgReview": 0, "count": 1, "totalReviews": 2}, "라퓨레브": {"sales": 17, "avgReview": 99, "count": 1, "totalReviews": 248}, "살림백서": {"sales": 33, "avgReview": 98, "count": 2, "totalReviews": 213}, "매치스라이프": {"sales": 50, "avgReview": 99, "count": 7, "totalReviews": 2454}, "로즈마인": {"sales": 61, "avgReview": 99, "count": 6, "totalReviews": 3196}, "스타일셀러": {"sales": 17, "avgReview": 0, "count": 1, "totalReviews": 0}, "유니픽쳐x프롱화장품": {"sales": 13, "avgReview": 90, "count": 1, "totalReviews": 188}, "JVELY": {"sales": 12, "avgReview": 98, "count": 1, "totalReviews": 65}, "유니비키": {"sales": 12, "avgReview": 0, "count": 1, "totalReviews": 9}, "스팟세일": {"sales": 0, "avgReview": 99, "count": 2, "totalReviews": 62}, "살림장만": {"sales": 43, "avgReview": 100, "count": 1, "totalReviews": 34}, "나후마켓": {"sales": 0, "avgReview": 100, "count": 1, "totalReviews": 17}, "바디브": {"sales": 19, "avgReview": 100, "count": 1, "totalReviews": 1099}, "푸르내음": {"sales": 10, "avgReview": 96, "count": 2, "totalReviews": 246}, "아미코리아": {"sales": 23, "avgReview": 99, "count": 1, "totalReviews": 145}, "지아자": {"sales": 12, "avgReview": 100, "count": 2, "totalReviews": 42}, "블라세아": {"sales": 0, "avgReview": 100, "count": 1, "totalReviews": 1383}, "수지코리아": {"sales": 10, "avgReview": 98, "count": 2, "totalReviews": 531}, "로샵": {"sales": 21, "avgReview": 98, "count": 2, "totalReviews": 93}, "바라스토어": {"sales": 0, "avgReview": 0, "count": 1, "totalReviews": 5}, "살림하기 좋은 날": {"sales": 0, "avgReview": 0, "count": 1, "totalReviews": 5}, "쇼핑욜로": {"sales": 0, "avgReview": 96, "count": 1, "totalReviews": 24}};
+
+const fmt = n => n >= 1000 ? (n/1000).toFixed(1)+'K' : n;
+const fmtW = n => '₩' + n.toLocaleString('ko-KR');
+
+// 카테고리 맵
+const catMap = {};
+rawData.forEach(item => {
+  if (!catMap[item.category]) catMap[item.category] = [];
+  catMap[item.category].push(item);
+});
+
+// ============================================================
+// TOP5 + 트렌드 + 이상값
+// ============================================================
+function renderTop5() {
+  const top5 = rawData.sort((a,b) => b.salesCount - a.salesCount).slice(0,5);
+  const maxSales = top5[0].salesCount;
+  
+  document.getElementById('top5List').innerHTML = top5.map((d,i) => {
+    const badgeClass = i === 0 ? 'rank-1' : i === 1 ? 'rank-2' : i === 2 ? 'rank-3' : 'rank-other';
+    const progress = (d.salesCount / maxSales * 100);
+    const progressColor = i === 0 ? '#FEE500' : i === 1 ? '#e8e8e8' : i === 2 ? '#f4c97a' : '#d0d0d0';
+    
+    return `<div class="flex items-start gap-3 p-3 rounded-xl border border-gray-100 hover:border-yellow-300 transition-all">
+      <div class="rank-badge ${badgeClass}">${i+1}</div>
+      <div class="flex-1 min-w-0">
+        <p class="font-bold text-gray-900 text-sm leading-tight truncate">${d.product}</p>
+        <div class="flex flex-wrap items-center gap-2 mt-1">
+          <span class="text-xs text-gray-500 bg-gray-100 px-2 py-0.5 rounded-full">${d.brand}</span>
+          <span class="text-xs text-yellow-700 bg-yellow-100 px-2 py-0.5 rounded-full">${d.subCategory}</span>
+          <span class="text-xs text-gray-500">⭐ ${d.reviewRate}%</span>
+        </div>
+        <div class="mt-2">
+          <div class="flex justify-between text-xs mb-1">
+            <span class="font-bold text-gray-800">${fmt(d.salesCount)}개 판매 중</span>
+          </div>
+          <div class="w-full bg-gray-100 rounded-full h-2">
+            <div class="h-2 rounded-full" style="width:${progress}%;background:${progressColor};"></div>
+          </div>
+        </div>
+      </div>
+      <div class="text-right flex-shrink-0">
+        <div class="font-bold text-lg text-gray-900">${fmt(d.salesCount)}</div>
+        <div class="text-xs text-gray-400">구매 중</div>
+        <div class="text-xs font-semibold text-yellow-600 mt-1">${fmtW(d.price)}</div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function renderTrend() {
+  const insights = [
+    { emoji: '💅', title: '색조 제품의 강세', text: '립/아이제품 중심으로 높은 만족도 기록 중' },
+    { emoji: '✨', title: '스킨케어 시장 확대', text: '전체의 50% 이상이 스킨케어 제품' },
+    { emoji: '🧴', title: '헤어케어 안정 수요', text: '헤어케어 제품의 꾸준한 판매량 유지' },
+    { emoji: '⭐', title: '높은 품질 만족도', text: '대부분 제품이 90% 이상의 만족률 기록' },
+    { emoji: '🏆', title: '강력한 브랜드들', text: 'FULLY, 메디올 등 대형 브랜드 점유율 높음' }
+  ];
+
+  document.getElementById('trendSummary').innerHTML = insights.map(i => `
+    <div class="flex items-start gap-3 p-4 rounded-xl bg-gradient-to-r from-yellow-50 to-white border border-yellow-100">
+      <span class="text-2xl">${i.emoji}</span>
+      <div>
+        <p class="font-bold text-gray-900 mb-1">${i.title}</p>
+        <p class="text-gray-600 text-sm leading-relaxed">${i.text}</p>
+      </div>
+    </div>
+  `).join('');
+}
+
+function renderOutliers() {
+  const newOpps = rawData.filter(d => d.salesCount >= 200 && d.reviewCount < 100);
+  const verified = rawData.filter(d => d.salesCount >= 300 && d.reviewRate >= 95);
+
+  document.getElementById('outlierProducts').innerHTML = `
+    <div class="p-4 rounded-xl border-2 border-blue-200 bg-blue-50">
+      <p class="font-bold text-blue-800 mb-3">🚀 신규 진입 기회 — 판매량 높지만 리뷰 적음</p>
+      <div class="space-y-2">
+        ${newOpps.sort((a,b)=>b.salesCount-a.salesCount).slice(0,5).map(d => `
+          <div class="flex justify-between items-center text-sm bg-white rounded-lg px-3 py-2">
+            <span class="font-medium text-gray-800 truncate mr-2">${d.product.slice(0,35)}...</span>
+            <span class="flex-shrink-0 text-blue-700 font-bold">${fmt(d.salesCount)}개</span>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+    <div class="p-4 rounded-xl border-2 border-orange-200 bg-orange-50">
+      <p class="font-bold text-orange-800 mb-3">⭐ 검증된 상품 — 높은 만족률 & 판매량</p>
+      <div class="space-y-2">
+        ${verified.sort((a,b)=>b.salesCount-a.salesCount).slice(0,5).map(d => `
+          <div class="flex justify-between items-center text-sm bg-white rounded-lg px-3 py-2">
+            <span class="font-medium text-gray-800 truncate mr-2">${d.product.slice(0,35)}...</span>
+            <span class="flex-shrink-0 text-orange-700 font-bold">⭐${d.reviewRate}%</span>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+  `;
+}
+
+// ============================================================
+// 탭1: 소분류 차트 + 분석표
+// ============================================================
+let categoryChartInstance = null;
+function renderCategoryChart() {
+  const subs = Object.entries(subCatData)
+    .map(([name, data]) => ({name, ...data}))
+    .sort((a,b) => b.sales - a.sales)
+    .slice(0,10);
+
+  const ctx = document.getElementById('categoryBarChart').getContext('2d');
+  if (categoryChartInstance) categoryChartInstance.destroy();
+  categoryChartInstance = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: subs.map(s => s.name),
+      datasets: [{label: '구매 중 갯수', data: subs.map(s => s.sales), backgroundColor: '#FEE500', borderColor: '#e6cf00', borderWidth: 2}]
+    },
+    options: {
+      indexAxis: 'y',
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: { x: { grid: { color: '#f5f5f5' }, ticks: { callback: v => fmt(v) } } }
+    }
+  });
+}
+
+function renderCategoryTable() {
+  const subs = Object.entries(subCatData)
+    .map(([name, data]) => ({name, ...data}))
+    .sort((a,b) => b.sales - a.sales);
+
+  document.getElementById('categoryTable').innerHTML = `
+    <thead><tr>
+      <th>순위</th>
+      <th>소분류</th>
+      <th>구매 중 갯수</th>
+      <th>상품 수</th>
+      <th>평균 만족률</th>
+      <th>총 리뷰 수</th>
+    </tr></thead>
+    <tbody>
+    ${subs.map((s,i) => `
+      <tr>
+        <td class="text-center font-bold">${i+1}</td>
+        <td class="font-medium">${s.name}</td>
+        <td class="font-bold text-yellow-700">${fmt(s.sales)}</td>
+        <td>${s.count}</td>
+        <td><span class="text-sm font-bold">${s.avgReview}%</span></td>
+        <td>${fmt(s.totalReviews)}</td>
+      </tr>
+    `).join('')}
+    </tbody>
+  `;
+}
+
+// ============================================================
+// 탭2: 브랜드 차트 + 분석표
+// ============================================================
+let brandDonutChartInstance = null, brandReviewChartInstance = null;
+function renderBrandCharts() {
+  const brands = Object.entries(brandData)
+    .map(([name, data]) => ({name, ...data}))
+    .sort((a,b) => b.sales - a.sales)
+    .slice(0,10);
+
+  // 도넛차트
+  const ctx1 = document.getElementById('brandDonutChart').getContext('2d');
+  if (brandDonutChartInstance) brandDonutChartInstance.destroy();
+  brandDonutChartInstance = new Chart(ctx1, {
+    type: 'doughnut',
+    data: {
+      labels: brands.map(b => b.name),
+      datasets: [{data: brands.map(b => b.sales), backgroundColor: ['#FEE500','#a78bfa','#10b981','#f472b6','#fb923c','#fbbf24','#60a5fa','#34d399','#818cf8','#f97316']}]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { position: 'bottom', labels: { font: { size: 11 } } } }
+    }
+  });
+
+  // 리뷰 차트
+  const ctx2 = document.getElementById('brandReviewChart').getContext('2d');
+  if (brandReviewChartInstance) brandReviewChartInstance.destroy();
+  brandReviewChartInstance = new Chart(ctx2, {
+    type: 'bar',
+    data: {
+      labels: brands.map(b => b.name),
+      datasets: [{label: '평균 만족률', data: brands.map(b => b.avgReview), backgroundColor: '#10b981', borderColor: '#059669', borderWidth: 1}]
+    },
+    options: {
+      indexAxis: 'y',
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: { x: { min: 0, max: 100 } }
+    }
+  });
+}
+
+function renderBrandTable() {
+  const brands = Object.entries(brandData)
+    .map(([name, data]) => ({name, ...data}))
+    .sort((a,b) => b.sales - a.sales);
+
+  document.getElementById('brandTable').innerHTML = `
+    <thead><tr>
+      <th>순위</th>
+      <th>브랜드명</th>
+      <th>구매 중 갯수</th>
+      <th>상품 수</th>
+      <th>평균 만족률</th>
+      <th>총 리뷰 수</th>
+    </tr></thead>
+    <tbody>
+    ${brands.map((b,i) => `
+      <tr>
+        <td class="text-center font-bold">${i+1}</td>
+        <td class="font-medium">${b.name}</td>
+        <td class="font-bold text-yellow-700">${fmt(b.sales)}</td>
+        <td>${b.count}</td>
+        <td><span class="text-sm font-bold">${b.avgReview}%</span></td>
+        <td>${fmt(b.totalReviews)}</td>
+      </tr>
+    `).join('')}
+    </tbody>
+  `;
+}
+
+// ============================================================
+// 탭3: 버블차트 + 기회상품
+// ============================================================
+let bubbleChartInstance = null;
+function renderBubbleChart() {
+  const newOpps = rawData.filter(d => d.salesCount >= 300 && d.reviewCount < 200);
+  const verified = rawData.filter(d => d.salesCount >= 300 && d.reviewRate >= 95);
+
+  const ctx = document.getElementById('opportunityBubbleChart').getContext('2d');
+  if (bubbleChartInstance) bubbleChartInstance.destroy();
+  
+  // 데이터에 상품 정보 추가
+  const newOppsWithInfo = newOpps.map(d => ({
+    x: d.reviewCount,
+    y: d.salesCount,
+    r: d.reviewRate/10,
+    product: d.product,
+    brand: d.brand,
+    reviewRate: d.reviewRate,
+    reviewCount: d.reviewCount,
+    price: d.price
+  }));
+  
+  const verifiedWithInfo = verified.map(d => ({
+    x: d.reviewCount,
+    y: d.salesCount,
+    r: d.reviewRate/10,
+    product: d.product,
+    brand: d.brand,
+    reviewRate: d.reviewRate,
+    reviewCount: d.reviewCount,
+    price: d.price
+  }));
+  
+  bubbleChartInstance = new Chart(ctx, {
+    type: 'bubble',
+    data: {
+      datasets: [
+        {
+          label: '신규 진입 기회',
+          data: newOppsWithInfo,
+          backgroundColor: 'rgba(59,130,246,0.4)',
+          borderColor: '#3b82f6'
+        },
+        {
+          label: '검증된 인기',
+          data: verifiedWithInfo,
+          backgroundColor: 'rgba(34,197,94,0.4)',
+          borderColor: '#22c55e'
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { 
+        legend: { display: true, position: 'bottom' },
+        tooltip: {
+          backgroundColor: 'rgba(0,0,0,0.8)',
+          padding: 12,
+          titleFont: { size: 13, weight: 'bold' },
+          bodyFont: { size: 12 },
+          borderColor: '#FEE500',
+          borderWidth: 1,
+          callbacks: {
+            title: function(context) {
+              return context[0].raw.product.slice(0, 40);
+            },
+            label: function(context) {
+              const data = context.raw;
+              return [
+                '브랜드: ' + data.brand,
+                '가격: ' + fmtW(data.price),
+                '구매중: ' + fmt(data.y) + '개',
+                '리뷰수: ' + fmt(data.x) + '건',
+                '만족률: ⭐ ' + data.reviewRate + '%'
+              ];
+            }
+          }
+        }
+      },
+      scales: {
+        x: { title: { display: true, text: '리뷰 수', font: { size: 13, weight: '600' } }, grid: { color: '#f5f5f5' }, ticks: { callback: v => fmt(v) } },
+        y: { title: { display: true, text: '구매 중 갯수', font: { size: 13, weight: '600' } }, grid: { color: '#f5f5f5' }, ticks: { callback: v => fmt(v) } }
+      }
+    }
+  });
+
+  // 신규 진입 기회
+  document.getElementById('newOpportunityList').innerHTML = newOpps
+    .sort((a,b) => b.salesCount - a.salesCount)
+    .slice(0,5)
+    .map(d => `
+      <div class="text-sm p-2 rounded-lg bg-blue-50 flex justify-between items-center">
+        <span class="font-medium text-gray-800 truncate mr-2">${d.product.slice(0,25)}...</span>
+        <span class="text-blue-700 font-bold flex-shrink-0">${fmt(d.salesCount)}개</span>
+      </div>
+    `).join('');
+
+  // 검증된 상품
+  document.getElementById('verifiedList').innerHTML = verified
+    .sort((a,b) => b.salesCount - a.salesCount)
+    .slice(0,5)
+    .map(d => `
+      <div class="text-sm p-2 rounded-lg bg-green-50 flex justify-between items-center">
+        <span class="font-medium text-gray-800 truncate mr-2">${d.product.slice(0,25)}...</span>
+        <span class="text-green-700 font-bold flex-shrink-0">⭐${d.reviewRate}%</span>
+      </div>
+    `).join('');
+}
+
+// ============================================================
+// 탭4: TOP10
+// ============================================================
+let currentCat = null;
+function renderTop10() {
+  const cats = Object.keys(catMap).sort();
+  currentCat = currentCat || cats[0];
+  
+  document.getElementById('categorySubTabs').innerHTML = cats.map(c => `
+    <button class="sub-tab-btn ${c===currentCat?'active':''}" onclick="selectCat('${c}')">${c}</button>
+  `).join('');
+  
+  renderTop10Table();
+}
+
+function selectCat(cat) {
+  currentCat = cat;
+  document.querySelectorAll('.sub-tab-btn').forEach(b => {
+    b.classList.toggle('active', b.textContent === cat);
+  });
+  renderTop10Table();
+}
+
+function renderTop10Table() {
+  const products = (catMap[currentCat] || []).sort((a,b)=>b.salesCount-a.salesCount).slice(0,10);
+  document.getElementById('top10Table').innerHTML = `
+    <thead><tr>
+      <th>순위</th>
+      <th>상품명</th>
+      <th>브랜드명</th>
+      <th>소분류</th>
+      <th>톡딜가</th>
+      <th>구매 중 갯수</th>
+      <th>리뷰 만족률</th>
+      <th>리뷰 수</th>
+    </tr></thead>
+    <tbody>
+    ${products.map((d,i) => `
+      <tr>
+        <td class="text-center font-bold">${
+          i===0 ? '<span class="inline-flex items-center justify-center w-7 h-7 rounded-full bg-yellow-300 text-gray-900 font-black text-sm">1</span>' :
+          i===1 ? '<span class="inline-flex items-center justify-center w-7 h-7 rounded-full bg-gray-200 text-gray-700 font-black text-sm">2</span>' :
+          i===2 ? '<span class="inline-flex items-center justify-center w-7 h-7 rounded-full bg-amber-200 text-amber-900 font-black text-sm">3</span>' :
+          i+1
+        }</td>
+        <td class="font-medium text-gray-800"><div class="truncate">${d.product}</div></td>
+        <td><span class="text-xs bg-yellow-100 text-yellow-800 px-2 py-0.5 rounded-full">${d.brand}</span></td>
+        <td class="text-gray-600">${d.subCategory}</td>
+        <td class="font-semibold text-right">${fmtW(d.price)}</td>
+        <td class="font-bold text-yellow-700 text-right">${fmt(d.salesCount)}</td>
+        <td class="text-center"><span class="text-xs font-bold">${d.reviewCount >= 10 ? '⭐ ' + d.reviewRate + '%' : '-'}</span></td>
+        <td class="text-right text-gray-600">${fmt(d.reviewCount)}</td>
+      </tr>
+    `).join('')}
+    </tbody>
+  `;
+}
+
+// ============================================================
+// 탭 전환
+// ============================================================
+let chartsRendered = { 1: false, 2: false, 3: false };
+function switchTab(idx) {
+  document.querySelectorAll('.tab-btn').forEach((b,i) => b.classList.toggle('active', i===idx));
+  document.querySelectorAll('.tab-content').forEach((c,i) => c.classList.toggle('active', i===idx));
+  
+  if (idx === 1 && !chartsRendered[1]) { renderCategoryChart(); renderCategoryTable(); chartsRendered[1] = true; }
+  if (idx === 2 && !chartsRendered[2]) { renderBrandCharts(); renderBrandTable(); chartsRendered[2] = true; }
+  if (idx === 3 && !chartsRendered[3]) { renderBubbleChart(); chartsRendered[3] = true; }
+  if (idx === 4) { renderTop10(); }
+}
+
+function downloadHTML() {
+  const html = '<!DOCTYPE html>\n' + document.documentElement.outerHTML;
+  const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = '카카오톡딜_뷰티_분석리포트_2026-07-15.html';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  renderTop5();
+  renderTrend();
+  renderOutliers();
+});
+</script>
+
+
+</body></html>

@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EBIN KOREA · MD Portfolio</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans+KR:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --paper:#F6F3EC;
+    --paper-deep:#EFEADD;
+    --ink:#1B1F22;
+    --ink-soft:#4A4F53;
+    --card:#FFFFFF;
+    --tag:#B23A2E;
+    --tag-dark:#8C2C22;
+    --data:#2F6E5D;
+    --kraft:#93897A;
+    --line:#DAD3C3;
+    --line-strong:#C7BEA9;
+  }
+  *{box-sizing:border-box;}
+  html{scroll-behavior:smooth;}
+  body{
+    margin:0;
+    background:var(--paper);
+    color:var(--ink);
+    font-family:'IBM Plex Sans KR','Noto Sans KR',sans-serif;
+    line-height:1.6;
+    -webkit-font-smoothing:antialiased;
+  }
+  .mono{font-family:'IBM Plex Mono',monospace;}
+  .display{font-family:'Space Grotesk','IBM Plex Sans KR',sans-serif;}
+  a{color:inherit;}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 28px;}
+
+  /* ---------- header ---------- */
+  header{
+    padding:22px 0;
+    border-bottom:1px solid var(--line);
+  }
+  header .wrap{display:flex;justify-content:space-between;align-items:center;}
+  .brand{
+    font-family:'Space Grotesk',sans-serif;
+    font-weight:700;
+    font-size:15px;
+    letter-spacing:0.14em;
+  }
+  .brand span{color:var(--tag);}
+  nav a{
+    font-family:'IBM Plex Mono',monospace;
+    font-size:11px;
+    letter-spacing:0.06em;
+    text-decoration:none;
+    color:var(--ink-soft);
+    margin-left:22px;
+  }
+  nav a:hover{color:var(--tag);}
+
+  /* ---------- hero ---------- */
+  .hero{padding:76px 0 56px;}
+  .eyebrow{
+    font-family:'IBM Plex Mono',monospace;
+    font-size:12px;
+    letter-spacing:0.18em;
+    color:var(--kraft);
+    text-transform:uppercase;
+    margin-bottom:18px;
+  }
+  .eyebrow::before{content:'▸ ';color:var(--tag);}
+  h1.display{
+    font-size:clamp(34px,5.4vw,58px);
+    line-height:1.16;
+    font-weight:700;
+    margin:0 0 22px;
+    max-width:16ch;
+  }
+  .hero p.lead{
+    font-size:17px;
+    color:var(--ink-soft);
+    max-width:56ch;
+    margin:0 0 34px;
+  }
+  .barcode{
+    display:flex;
+    align-items:flex-end;
+    gap:2px;
+    height:34px;
+    margin-bottom:30px;
+  }
+  .barcode i{
+    display:block;
+    background:var(--ink);
+    width:2px;
+  }
+  .stat-strip{
+    display:flex;
+    flex-wrap:wrap;
+    gap:10px;
+  }
+  .chip{
+    font-family:'IBM Plex Mono',monospace;
+    font-size:12px;
+    letter-spacing:0.02em;
+    background:var(--card);
+    border:1px solid var(--line-strong);
+    padding:8px 14px;
+    border-radius:2px;
+  }
+  .chip b{color:var(--tag);}
+
+  /* ---------- section shell ---------- */
+  section{padding:52px 0;}
+  .section-head{margin-bottom:38px;}
+  .section-head .eyebrow{margin-bottom:10px;}
+  .section-head h2{
+    font-family:'Space Grotesk',sans-serif;
+    font-size:28px;
+    font-weight:700;
+    margin:0;
+  }
+
+  /* ---------- case files ---------- */
+  .cases{
+    background:var(--paper-deep);
+    border-top:1px solid var(--line);
+    border-bottom:1px solid var(--line);
+  }
+  .case-card{
+    position:relative;
+    background:var(--card);
+    margin:0 0 20px;
+    padding:30px 32px;
+    border:1px solid var(--line);
+    border-radius:10px;
+    border-left:3px solid var(--data);
+    box-shadow:0 1px 2px rgba(27,31,34,0.04);
+    transition:transform .2s ease, box-shadow .2s ease, border-color .2s ease;
+  }
+  .case-card:hover{
+    transform:translateY(-2px);
+    box-shadow:0 8px 20px rgba(27,31,34,0.07);
+    border-left-color:var(--tag-dark);
+  }
+  .case-card:last-child{margin-bottom:0;}
+  .sku{
+    font-family:'IBM Plex Mono',monospace;
+    font-size:11px;
+    letter-spacing:0.1em;
+    color:var(--tag-dark);
+    text-transform:uppercase;
+    margin-bottom:10px;
+  }
+  .case-card h3{
+    font-family:'Space Grotesk',sans-serif;
+    font-size:22px;
+    margin:0 0 12px;
+    font-weight:700;
+  }
+  .case-card p.desc{
+    color:var(--ink-soft);
+    font-size:15px;
+    max-width:60ch;
+    margin:0 0 20px;
+  }
+  .case-stats{
+    display:flex;
+    flex-wrap:wrap;
+    gap:8px 22px;
+    margin-bottom:22px;
+    padding:14px 0;
+    border-top:1px dashed var(--line-strong);
+    border-bottom:1px dashed var(--line-strong);
+  }
+  .case-stats div{font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:var(--ink-soft);}
+  .case-stats b{display:block;font-size:17px;color:var(--data);font-weight:600;font-family:'Space Grotesk',sans-serif;}
+  .open-link{
+    display:inline-flex;
+    align-items:center;
+    gap:8px;
+    font-family:'IBM Plex Mono',monospace;
+    font-size:12.5px;
+    letter-spacing:0.04em;
+    text-decoration:none;
+    color:var(--tag-dark);
+    font-weight:600;
+    border-bottom:1px solid var(--tag-dark);
+    padding-bottom:2px;
+  }
+  .open-link:hover{color:var(--tag);border-color:var(--tag);}
+  .open-link svg{width:13px;height:13px;}
+
+  /* ---------- toolkit ---------- */
+  .toolkit-groups{
+    display:grid;
+    grid-template-columns:repeat(3,1fr);
+    gap:18px;
+  }
+  .tool-group{
+    background:var(--card);
+    border:1px solid var(--line);
+    border-radius:10px;
+    padding:20px 22px;
+  }
+  .tool-group h3{
+    font-family:'IBM Plex Mono',monospace;
+    font-size:11px;
+    letter-spacing:0.1em;
+    text-transform:uppercase;
+    color:var(--data);
+    margin:0 0 14px;
+  }
+  .tool-tags{display:flex;flex-wrap:wrap;gap:8px;}
+  .tool-tags span{
+    font-size:13px;
+    padding:6px 12px;
+    border-radius:999px;
+    background:var(--paper-deep);
+    color:var(--ink-soft);
+    border:1px solid var(--line);
+  }
+  @media (max-width:760px){
+    .toolkit-groups{grid-template-columns:1fr;}
+  }
+
+  /* ---------- philosophy ---------- */
+  .philosophy{
+    display:flex;
+    justify-content:center;
+    padding:56px 0 64px;
+  }
+  .stamp{
+    max-width:600px;
+    text-align:center;
+    border-left:3px solid var(--data);
+    padding:4px 0 4px 24px;
+  }
+  .stamp p{
+    font-family:'Space Grotesk',sans-serif;
+    font-size:19px;
+    line-height:1.55;
+    color:var(--ink);
+    margin:0;
+    font-weight:600;
+    text-align:left;
+  }
+
+  /* ---------- footer ---------- */
+  footer{
+    border-top:1px solid var(--line);
+    padding:28px 0;
+  }
+  footer .wrap{
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    flex-wrap:wrap;
+    gap:10px;
+  }
+  footer .mono{font-size:11.5px;color:var(--kraft);letter-spacing:0.05em;}
+
+  @media (max-width:640px){
+    .case-card{padding:24px 20px;}
+  }
+  @media (prefers-reduced-motion: reduce){
+    html{scroll-behavior:auto;}
+    .case-card{transition:none;}
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <div class="brand">EBIN <span>KOREA</span></div>
+    <nav>
+      <a href="#cases">CASE FILES</a>
+      <a href="#toolkit">TOOLKIT</a>
+      <a href="#about">ABOUT</a>
+    </nav>
+  </div>
+</header>
+
+<section class="hero">
+  <div class="wrap">
+    <div class="eyebrow">EBIN KOREA · MD Portfolio</div>
+    <h1 class="display">데이터로 증명하는<br>상품 기획</h1>
+    <p class="lead">
+      왜 팔리고, 왜 팔리지 않는지는 숫자를 뜯어봐야 보입니다.
+      리뷰 548건, 키워드 500건, 톡딜 상품 89건을 직접 분석해
+      상품 운영에 바로 쓸 수 있는 인사이트로 정리한 프로젝트 3건입니다.
+    </p>
+    <div class="barcode" aria-hidden="true">
+      <i style="height:60%;width:2px;"></i><i style="height:100%;"></i><i style="height:45%;"></i>
+      <i style="height:80%;width:3px;"></i><i style="height:55%;"></i><i style="height:100%;width:2px;"></i>
+      <i style="height:35%;"></i><i style="height:70%;width:3px;"></i><i style="height:90%;"></i>
+      <i style="height:50%;"></i><i style="height:100%;width:2px;"></i><i style="height:40%;width:3px;"></i>
+      <i style="height:75%;"></i><i style="height:60%;"></i><i style="height:95%;width:2px;"></i>
+      <i style="height:30%;"></i><i style="height:65%;width:3px;"></i><i style="height:100%;"></i>
+      <i style="height:45%;"></i><i style="height:85%;"></i>
+    </div>
+    <div class="stat-strip">
+      <div class="chip"><b>548건</b> 리뷰 VOC 분석</div>
+      <div class="chip"><b>500건</b> 뷰티 키워드 분석</div>
+      <div class="chip"><b>89개</b> 톡딜 상품 분석</div>
+    </div>
+  </div>
+</section>
+
+<section class="cases" id="cases">
+  <div class="wrap">
+    <div class="section-head" style="padding-top:52px;">
+      <div class="eyebrow">Case Files</div>
+      <h2>프로젝트 3건</h2>
+    </div>
+
+    <article class="case-card">
+      <div class="sku">SKU-01 · VOC Review Analysis</div>
+      <h3>고릴라 왁싱 코털제거기 리뷰 분석</h3>
+      <p class="desc">
+        리뷰 548건을 형태소 분석과 문장 단위 감성 판별로 재구성해,
+        "언급됨"과 "불만임"을 구분했습니다. 평점만으로는 드러나지 않는
+        평점-감성 불일치 리뷰까지 짚어 액션 가능한 이슈만 골라냈습니다.
+      </p>
+      <div class="case-stats">
+        <div><b>548건</b>총 리뷰 수</div>
+        <div><b>4.8★</b>평균 평점</div>
+        <div><b>23건</b>액션 가능 리뷰</div>
+        <div><b>17건</b>평점-감성 불일치</div>
+      </div>
+      <a class="open-link" href="review-analysis.html" target="_blank" rel="noopener">
+        대시보드 열기
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 17L17 7M7 7h10v10"/></svg>
+      </a>
+    </article>
+
+    <article class="case-card">
+      <div class="sku">SKU-02 · Keyword Intelligence</div>
+      <h3>뷰티 카테고리 키워드 인텔리전스</h3>
+      <p class="desc">
+        ItemScout 키워드 500건을 브랜드·제품군·성분/효능으로 분해하고,
+        엔트로피 가중치 기반 기회점수로 Blue Ocean 키워드와 진입 우선순위를
+        계산해 MD 추천 등급까지 자동 생성했습니다.
+      </p>
+      <div class="case-stats">
+        <div><b>500건</b>분석 키워드</div>
+        <div><b>994만</b>월 총 검색량</div>
+        <div><b>142건</b>Blue Ocean 키워드</div>
+        <div><b>48.6%</b>브랜드 키워드 비율</div>
+      </div>
+      <a class="open-link" href="keyword-analysis.html" target="_blank" rel="noopener">
+        대시보드 열기
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 17L17 7M7 7h10v10"/></svg>
+      </a>
+    </article>
+
+    <article class="case-card">
+      <div class="sku">SKU-03 · Commerce Analytics</div>
+      <h3>카카오 톡딜 뷰티 상품 분석</h3>
+      <p class="desc">
+        톡딜 뷰티 카테고리 상품 89개의 판매량·리뷰·만족률을 교차 분석해,
+        판매는 높지만 리뷰가 적은 신규 진입 기회 상품과 이미 검증된
+        인기 상품을 구분했습니다.
+      </p>
+      <div class="case-stats">
+        <div><b>89개</b>분석 상품 수</div>
+        <div><b>50%+</b>스킨케어 비중</div>
+        <div><b>90%+</b>다수 제품 만족률</div>
+        <div><b>TOP5</b>급상승 상품 추적</div>
+      </div>
+      <a class="open-link" href="talkdeal-analysis.html" target="_blank" rel="noopener">
+        대시보드 열기
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 17L17 7M7 7h10v10"/></svg>
+      </a>
+    </article>
+
+  </div>
+</section>
+
+<section id="toolkit">
+  <div class="wrap">
+    <div class="section-head">
+      <div class="eyebrow">Toolkit</div>
+      <h2>사용 도구</h2>
+    </div>
+    <div class="toolkit-groups">
+      <div class="tool-group">
+        <h3>데이터 &amp; 분석</h3>
+        <div class="tool-tags">
+          <span>Excel</span>
+          <span>Google Sheets</span>
+          <span>SQL</span>
+          <span>Python</span>
+          <span>ItemScout</span>
+          <span>Naver DataLab</span>
+        </div>
+      </div>
+      <div class="tool-group">
+        <h3>구축 &amp; 자동화</h3>
+        <div class="tool-tags">
+          <span>HTML / CSS / JS</span>
+          <span>사방넷</span>
+          <span>Make</span>
+          <span>GitHub Pages</span>
+        </div>
+      </div>
+      <div class="tool-group">
+        <h3>AI 어시스턴트</h3>
+        <div class="tool-tags">
+          <span>ChatGPT</span>
+          <span>Claude</span>
+          <span>Gemini</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="about">
+  <div class="wrap philosophy">
+    <div class="stamp">
+      <p>
+        "온라인 MD는 데이터를 통해 왜 팔리는지,<br>
+        왜 팔리지 않는지를 설명할 수 있어야 한다."
+      </p>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="mono">EBIN KOREA — PRODUCT &amp; MARKET ANALYSIS PORTFOLIO</div>
+    <div class="mono">BUILT WITH HTML · CSS · CHART.JS</div>
+  </div>
+</footer>
+
+</body>
+</html>
